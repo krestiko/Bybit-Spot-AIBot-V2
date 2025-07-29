@@ -1,4 +1,4 @@
-""Bybit trading bot package."""
+"""Bybit trading bot package."""
 
 from .bot import TradingBot
 
