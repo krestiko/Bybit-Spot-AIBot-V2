@@ -1,416 +1,451 @@
-import time
 import os
+import time
 import logging
-import numpy as np
-import requests
-from sklearn.linear_model import SGDClassifier
-from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import cross_val_score, GridSearchCV
-from xgboost import XGBClassifier
-import pandas as pd
-np.NaN = np.nan  # compatibility for pandas_ta
-import pandas_ta as ta
+from typing import List, Optional
+
 import joblib
-from pybit.unified_trading import HTTP
-from dotenv import load_dotenv
+import numpy as np
+np.NaN = np.nan  # compatibility for pandas_ta
+import pandas as pd
+import pandas_ta as ta
+import requests
 import yaml
+from dotenv import load_dotenv
+from pybit.unified_trading import HTTP
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.linear_model import SGDClassifier
+from sklearn.model_selection import GridSearchCV, cross_val_score
+from sklearn.preprocessing import StandardScaler
+from xgboost import XGBClassifier
 
 load_dotenv()
-config_path = os.getenv("CONFIG_FILE", "config.yaml")
-if os.path.exists(config_path):
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f) or {}
-else:
-    config = {}
-log_file = os.getenv("LOG_FILE", "bot.log")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler(log_file), logging.StreamHandler()]
-)
 
-api_key = os.getenv("BYBIT_API_KEY")
-api_secret = os.getenv("BYBIT_API_SECRET")
-symbol = os.getenv("SYMBOL", "BTCUSDT")
-trade_amount = float(os.getenv("TRADE_AMOUNT_USDT", 10))
-tp_percent = float(config.get("trade", {}).get("tp_percent", os.getenv("TP_PERCENT", 1.5)))
-sl_percent = float(config.get("trade", {}).get("sl_percent", os.getenv("SL_PERCENT", 1.0)))
-interval = int(os.getenv("INTERVAL", 5)) * 60
-max_retries = int(os.getenv("MAX_RETRIES", 3))
 
-# interval between full retraining with hyperparameter search
-retrain_interval = int(os.getenv("RETRAIN_INTERVAL", 50))
-train_counter = 0
+class TradingBot:
+    """Simple trading bot encapsulating state and trading logic."""
 
-# length of price history to use for learning
-history_len = int(os.getenv("HISTORY_LENGTH", 100))
-price_file = os.getenv("PRICE_HISTORY_FILE", "price_history.csv")
-trade_file = os.getenv("TRADE_HISTORY_FILE", "trade_history.csv")
-trailing_percent = float(os.getenv("TRAILING_PERCENT", 0))
-model_type = config.get("trade", {}).get("model_type", os.getenv("MODEL_TYPE", "gb"))
-daily_loss_limit = float(os.getenv("DAILY_STOP_LOSS", 0))
-daily_profit_limit = float(os.getenv("DAILY_TAKE_PROFIT", 0))
-
-indicators = config.get("trade", {}).get(
-    "indicators",
-    [
-        "rsi",
-        "macd",
-        "bb",
-        "sma",
-        "ema",
-        "adx",
-        "stoch",
-        "obv",
-    ],
-)
-
-telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
-telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
-
-# file to store the trained model
-model_file = os.getenv("MODEL_FILE", "model.pkl")
-
-# containers for market history and ML model
-history_df = pd.DataFrame(columns=["close", "volume", "bid_qty", "ask_qty"])
-features_list = []
-labels_list = []
-scaler = StandardScaler()
-if os.path.exists(model_file):
-    saved = joblib.load(model_file)
-    model = saved.get("model")
-    scaler = saved.get("scaler", scaler)
-    model_initialized = True
-else:
-    if model_type == "xgb":
-        model = XGBClassifier(use_label_encoder=False, eval_metric="logloss")
-    elif model_type == "gb":
-        model = GradientBoostingClassifier()
-    else:
-        model = SGDClassifier(loss="log_loss")
-    model_initialized = False
-
-# price and amount of the current position; None means no position
-position_price = None
-position_amount = 0.0
-daily_pnl = 0.0
-daily_date = time.strftime("%Y-%m-%d")
-
-def send_telegram(msg):
-    if not telegram_token or not telegram_chat_id: return
-    try:
-        requests.post(f"https://api.telegram.org/bot{telegram_token}/sendMessage",
-                      data={"chat_id": telegram_chat_id, "text": msg})
-    except Exception as e:
-        logging.warning(f"Telegram error: {e}")
-
-def fetch_news_sentiment():
-    token = os.getenv("CRYPTO_NEWS_TOKEN")
-    if not token:
-        return 0.0
-    try:
-        resp = requests.get(
-            "https://cryptopanic.com/api/v1/posts/",
-            params={"auth_token": token, "kind": "news", "public": "true"},
-            timeout=10,
+    def __init__(self, config_file: str = "config.yaml") -> None:
+        self.config = self._load_config(config_file)
+        self.api_key = os.getenv("BYBIT_API_KEY")
+        self.api_secret = os.getenv("BYBIT_API_SECRET")
+        self.symbol = os.getenv("SYMBOL", "BTCUSDT")
+        self.trade_amount = float(os.getenv("TRADE_AMOUNT_USDT", 10))
+        self.tp_percent = float(
+            self.config.get("trade", {}).get("tp_percent", os.getenv("TP_PERCENT", 1.5))
         )
-        data = resp.json()
-        posts = data.get("results", [])[:10]
-        score = 0.0
-        for p in posts:
-            if p.get("positive_votes", 0) >= p.get("negative_votes", 0):
-                score += 1
-            else:
-                score -= 1
-        return score / max(len(posts), 1)
-    except Exception as e:
-        logging.warning(f"News fetch error: {e}")
-        return 0.0
-
-session = HTTP(api_key=api_key, api_secret=api_secret)
-
-def get_market_data():
-    for _ in range(max_retries):
-        try:
-            tick = session.get_tickers(category="spot", symbol=symbol)
-            ticker = tick["result"]["list"][0]
-            price = float(ticker["lastPrice"])
-            volume = float(ticker.get("turnover24h", 0))
-            ob = session.get_orderbook(category="spot", symbol=symbol, limit=1)
-            bid_qty = float(ob["result"]["b"][0][1])
-            ask_qty = float(ob["result"]["a"][0][1])
-            return price, volume, bid_qty, ask_qty
-        except Exception as e:
-            logging.warning(f"Market data error: {e}")
-            time.sleep(1)
-    raise RuntimeError("Failed to fetch market data")
-
-def compute_features(df):
-    df = df.copy()
-    feats = []
-    required = []
-    if "rsi" in indicators:
-        df["rsi"] = ta.rsi(df["close"], length=14)
-        required.append("rsi")
-    if "macd" in indicators:
-        macd = ta.macd(df["close"])
-        df["macd"] = macd["MACD_12_26_9"]
-        required.append("macd")
-    if "bb" in indicators:
-        bb = ta.bbands(df["close"], length=5)
-        df["bb_upper"] = bb["BBU_5_2.0"]
-        df["bb_lower"] = bb["BBL_5_2.0"]
-        required.extend(["bb_upper", "bb_lower"])
-    if "sma" in indicators:
-        df["sma"] = ta.sma(df["close"], length=10)
-        required.append("sma")
-    if "ema" in indicators:
-        df["ema"] = ta.ema(df["close"], length=10)
-        required.append("ema")
-    if "adx" in indicators:
-        adx = ta.adx(df["close"], length=14)
-        df["adx"] = adx["ADX_14"]
-        required.append("adx")
-    if "stoch" in indicators:
-        stoch = ta.stoch(df["close"])
-        df["stoch_k"] = stoch["STOCHk_14_3_3"]
-        df["stoch_d"] = stoch["STOCHd_14_3_3"]
-        required.extend(["stoch_k", "stoch_d"])
-    if "obv" in indicators:
-        df["obv"] = ta.obv(df["close"], df["volume"])
-        required.append("obv")
-    df["bid_ask_ratio"] = (df["bid_qty"] - df["ask_qty"]) / (df["bid_qty"] + df["ask_qty"])
-    required.append("bid_ask_ratio")
-    if "news" in indicators:
-        df["sentiment"] = fetch_news_sentiment()
-        required.append("sentiment")
-    row = df.iloc[-1]
-    if row[required].isna().any():
-        return None
-    feats = row[required + ["volume"]].values
-    return np.array(feats, dtype=float).reshape(1, -1)
-
-def append_market_data(price, volume, bid, ask):
-    global history_df
-    history_df.loc[len(history_df)] = [price, volume, bid, ask]
-    if len(history_df) > history_len + 50:
-        history_df = history_df.iloc[-(history_len + 50):]
-    history_df.to_csv(price_file, index=False)
-
-def update_model(price, volume, bid, ask):
-    global model_initialized, model, train_counter
-    append_market_data(price, volume, bid, ask)
-    if len(history_df) < history_len + 1:
-        return None
-    df = history_df.iloc[-(history_len + 1):]
-    features = compute_features(df.iloc[:-1])
-    if features is None:
-        return None
-    label = 1 if df["close"].iloc[-1] > df["close"].iloc[-2] else 0
-    features_list.append(features.flatten())
-    labels_list.append(label)
-    if len(features_list) > history_len:
-        features_list.pop(0)
-        labels_list.pop(0)
-    X = np.array(features_list)
-    y = np.array(labels_list)
-    scaler.fit(X)
-    Xs = scaler.transform(X)
-    try:
-        do_full_train = (not model_initialized) or (train_counter % retrain_interval == 0)
-        if do_full_train:
-            if len(y) >= 20:
-                if model_type == "xgb":
-                    params = {"n_estimators": [50, 100], "max_depth": [3, 5], "learning_rate": [0.05, 0.1]}
-                elif model_type == "gb":
-                    params = {"n_estimators": [50, 100], "max_depth": [3, 5]}
-                else:
-                    params = {"alpha": [0.0001, 0.001]}
-                grid = GridSearchCV(model, params, cv=3, n_jobs=-1)
-                grid.fit(Xs, y)
-                model = grid.best_estimator_
-                score = grid.best_score_
-            else:
-                model.fit(Xs, y)
-                score = cross_val_score(model, Xs, y, cv=3).mean() if len(y) >= 3 else None
-            if score is not None:
-                logging.info(f"CV score: {score:.3f}")
-        elif hasattr(model, "partial_fit"):
-            model.partial_fit(scaler.transform(features), [label], classes=np.array([0, 1]))
-    except Exception as e:
-        logging.warning(f"Model train error: {e}")
-    train_counter += 1
-    joblib.dump({"model": model, "scaler": scaler}, model_file)
-    model_initialized = True
-    latest = compute_features(df.iloc[-history_len:])
-    return scaler.transform(latest) if latest is not None else None
-
-def compute_trade_amount():
-    if len(history_df) < 10:
-        return trade_amount
-    vol = history_df["close"].pct_change().rolling(10).std().iloc[-1]
-    if pd.isna(vol) or vol == 0:
-        return trade_amount
-    factor = min(1.0, 0.02 / vol)
-    return trade_amount * factor
-
-def reset_daily_pnl():
-    global daily_pnl, daily_date
-    today = time.strftime("%Y-%m-%d")
-    if today != daily_date:
-        daily_date = today
-        daily_pnl = 0.0
-
-def update_pnl(profit):
-    global daily_pnl
-    daily_pnl += profit
-
-def log_trade(side, price, qty, pnl=0.0, tp=None, sl=None):
-    header = not os.path.exists(trade_file)
-    with open(trade_file, "a") as f:
-        if header:
-            f.write("time,side,price,qty,pnl,tp,sl\n")
-        f.write(
-            f"{time.strftime('%Y-%m-%d %H:%M:%S')},{side},{price},{qty},{pnl},{tp},{sl}\n"
+        self.sl_percent = float(
+            self.config.get("trade", {}).get("sl_percent", os.getenv("SL_PERCENT", 1.0))
         )
+        self.interval = int(os.getenv("INTERVAL", 5)) * 60
+        self.max_retries = int(os.getenv("MAX_RETRIES", 3))
+        self.retrain_interval = int(os.getenv("RETRAIN_INTERVAL", 50))
+        self.history_len = int(os.getenv("HISTORY_LENGTH", 100))
+        self.price_file = os.getenv("PRICE_HISTORY_FILE", "price_history.csv")
+        self.trade_file = os.getenv("TRADE_HISTORY_FILE", "trade_history.csv")
+        self.trailing_percent = float(os.getenv("TRAILING_PERCENT", 0))
+        self.model_type = self.config.get("trade", {}).get("model_type", os.getenv("MODEL_TYPE", "gb"))
+        self.daily_loss_limit = float(os.getenv("DAILY_STOP_LOSS", 0))
+        self.daily_profit_limit = float(os.getenv("DAILY_TAKE_PROFIT", 0))
+        self.indicators: List[str] = self.config.get(
+            "indicators",
+            ["rsi", "macd", "bb", "sma", "ema", "adx", "stoch", "obv"],
+        )
+        self.telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
+        self.model_file = os.getenv("MODEL_FILE", "model.pkl")
 
+        self.history_df = pd.DataFrame(columns=["close", "volume", "bid_qty", "ask_qty"])
+        self.features_list: List[np.ndarray] = []
+        self.labels_list: List[int] = []
+        self.scaler = StandardScaler()
+        self.train_counter = 0
+        self.model_initialized = False
+        self._init_model()
 
-simulate = not (api_key and api_secret)
-use_websocket = os.getenv("USE_WEBSOCKET", "0") == "1"
-last_price = None
-position_side = None  # 'long' or 'short'
-trailing_price = None
+        self.position_price: Optional[float] = None
+        self.position_amount: float = 0.0
+        self.trailing_price: Optional[float] = None
+        self.daily_pnl: float = 0.0
+        self.daily_date: str = time.strftime("%Y-%m-%d")
 
-def place_order(side, qty, tp=None, sl=None):
-    if simulate:
-        logging.info(f"Simulated order: {side} {qty}")
-        return {"price": last_price, "qty": qty}
-    for _ in range(max_retries):
-        try:
-            return session.place_order(
-                category="spot",
-                symbol=symbol,
-                side="Buy" if side.lower() == "buy" else "Sell",
-                orderType="Market",
-                qty=qty,
-                takeProfit=tp,
-                stopLoss=sl,
-            )
-        except Exception as e:
-            logging.warning(f"Order error: {e}")
-            time.sleep(1)
-    raise RuntimeError("Failed to place order")
+        self.session = HTTP(api_key=self.api_key, api_secret=self.api_secret)
+        self.last_price: Optional[float] = None
 
+    @staticmethod
+    def _load_config(path: str) -> dict:
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                return yaml.safe_load(f) or {}
+        return {}
 
-def open_long(price):
-    global position_price, position_amount, position_side, trailing_price
-    qty = compute_trade_amount() / price
-    place_order("buy", qty, tp=price * (1 + tp_percent / 100), sl=price * (1 - sl_percent / 100))
-    position_price = price
-    position_amount = qty
-    position_side = "long"
-    trailing_price = price * (1 - trailing_percent / 100) if trailing_percent else None
-    log_trade("buy", price, qty, tp=tp_percent, sl=sl_percent)
-    send_telegram(f"Opened long {qty:.6f} {symbol} @ {price}")
-
-
-def open_short(price):
-    global position_price, position_amount, position_side, trailing_price
-    qty = compute_trade_amount() / price
-    place_order("sell", qty, tp=price * (1 - tp_percent / 100), sl=price * (1 + sl_percent / 100))
-    position_price = price
-    position_amount = -qty
-    position_side = "short"
-    trailing_price = price * (1 + trailing_percent / 100) if trailing_percent else None
-    log_trade("sell", price, qty, tp=tp_percent, sl=sl_percent)
-    send_telegram(f"Opened short {qty:.6f} {symbol} @ {price}")
-
-
-def close_position(price):
-    global position_price, position_amount, position_side, trailing_price
-    if position_amount == 0:
-        return
-    side = "sell" if position_amount > 0 else "buy"
-    qty = abs(position_amount)
-    place_order(side, qty)
-    pnl = (price - position_price) * position_amount
-    update_pnl(pnl)
-    log_trade("close", price, qty, pnl)
-    send_telegram(f"Closed position {side} pnl={pnl:.2f}")
-    position_amount = 0
-    position_price = None
-    position_side = None
-    trailing_price = None
-
-
-def handle_trailing(price):
-    global trailing_price
-    if trailing_price is None:
-        return False
-    if position_side == "long":
-        if price > position_price and price * (1 - trailing_percent / 100) > trailing_price:
-            trailing_price = price * (1 - trailing_percent / 100)
-        if price <= trailing_price:
-            return True
-    else:
-        if price < position_price and price * (1 + trailing_percent / 100) < trailing_price:
-            trailing_price = price * (1 + trailing_percent / 100)
-        if price >= trailing_price:
-            return True
-    return False
-
-
-def trade_cycle():
-    global last_price
-    if use_websocket:
-        from pybit.unified_trading import WebSocket
-
-        def _cb(msg):
-            global last_price
-            data = msg.get("data")
-            if isinstance(data, list):
-                data = data[0]
-            lp = data.get("lastPrice") or data.get("lp")
-            if lp:
-                last_price = float(lp)
-
-        ws = WebSocket("spot")
-        ws.ticker_stream(symbol, _cb)
-
-    while True:
-        reset_daily_pnl()
-        if daily_loss_limit and daily_pnl <= -daily_loss_limit:
-            logging.warning("Daily loss limit reached")
-            break
-        if daily_profit_limit and daily_pnl >= daily_profit_limit:
-            logging.info("Daily profit target reached")
-            break
-        if last_price is None:
-            price, vol, bid, ask = get_market_data()
+    def _init_model(self) -> None:
+        if os.path.exists(self.model_file):
+            saved = joblib.load(self.model_file)
+            self.model = saved.get("model")
+            self.scaler = saved.get("scaler", self.scaler)
+            self.model_initialized = True
         else:
-            price = last_price
-            vol = 0
-            bid = ask = 0
-        features = update_model(price, vol, bid, ask)
-        if features is None:
-            time.sleep(interval)
-            continue
-        prob = model.predict_proba(features)[0][1]
+            if self.model_type == "xgb":
+                self.model = XGBClassifier(use_label_encoder=False, eval_metric="logloss")
+            elif self.model_type == "gb":
+                self.model = GradientBoostingClassifier()
+            else:
+                self.model = SGDClassifier(loss="log_loss")
+            self.model_initialized = False
 
-        if position_amount > 0:  # long
-            if price >= position_price * (1 + tp_percent / 100) or price <= position_price * (1 - sl_percent / 100) or handle_trailing(price):
-                close_position(price)
-        elif position_amount < 0:  # short
-            if price <= position_price * (1 - tp_percent / 100) or price >= position_price * (1 + sl_percent / 100) or handle_trailing(price):
-                close_position(price)
-        if position_amount == 0:
-            if prob > 0.55:
-                open_long(price)
-            elif prob < 0.45:
-                open_short(price)
-        time.sleep(interval)
+    # ------------------------------------------------------------------
+    def send_telegram(self, msg: str) -> None:
+        """Send message to telegram if credentials configured."""
+        if not self.telegram_token or not self.telegram_chat_id:
+            return
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{self.telegram_token}/sendMessage",
+                data={"chat_id": self.telegram_chat_id, "text": msg},
+            )
+        except Exception as exc:  # pragma: no cover - network issues
+            logging.warning("Telegram error: %s", exc)
+
+    def fetch_news_sentiment(self) -> float:
+        token = os.getenv("CRYPTO_NEWS_TOKEN")
+        if not token:
+            return 0.0
+        try:
+            resp = requests.get(
+                "https://cryptopanic.com/api/v1/posts/",
+                params={"auth_token": token, "kind": "news", "public": "true"},
+                timeout=10,
+            )
+            data = resp.json()
+            posts = data.get("results", [])[:10]
+            score = 0.0
+            for post in posts:
+                if post.get("positive_votes", 0) >= post.get("negative_votes", 0):
+                    score += 1
+                else:
+                    score -= 1
+            return score / max(len(posts), 1)
+        except Exception as exc:  # pragma: no cover - network issues
+            logging.warning("News fetch error: %s", exc)
+            return 0.0
+
+    # ------------------------------------------------------------------
+    def compute_features(self, df: pd.DataFrame) -> Optional[np.ndarray]:
+        """Compute indicator features for the given dataframe."""
+        df = df.copy()
+        required: List[str] = []
+        if "rsi" in self.indicators:
+            df["rsi"] = ta.rsi(df["close"], length=14)
+            required.append("rsi")
+        if "macd" in self.indicators:
+            macd = ta.macd(df["close"])
+            df["macd"] = macd["MACD_12_26_9"]
+            required.append("macd")
+        if "bb" in self.indicators:
+            bb = ta.bbands(df["close"], length=5)
+            df["bb_upper"] = bb["BBU_5_2.0"]
+            df["bb_lower"] = bb["BBL_5_2.0"]
+            required.extend(["bb_upper", "bb_lower"])
+        if "sma" in self.indicators:
+            df["sma"] = ta.sma(df["close"], length=10)
+            required.append("sma")
+        if "ema" in self.indicators:
+            df["ema"] = ta.ema(df["close"], length=10)
+            required.append("ema")
+        if "adx" in self.indicators:
+            adx = ta.adx(df["close"], length=14)
+            df["adx"] = adx["ADX_14"]
+            required.append("adx")
+        if "stoch" in self.indicators:
+            stoch = ta.stoch(df["close"])
+            df["stoch_k"] = stoch["STOCHk_14_3_3"]
+            df["stoch_d"] = stoch["STOCHd_14_3_3"]
+            required.extend(["stoch_k", "stoch_d"])
+        if "obv" in self.indicators:
+            df["obv"] = ta.obv(df["close"], df["volume"])
+            required.append("obv")
+        denom = df["bid_qty"] + df["ask_qty"]
+        df["bid_ask_ratio"] = np.where(denom == 0, 0, (df["bid_qty"] - df["ask_qty"]) / denom)
+        required.append("bid_ask_ratio")
+        if "news" in self.indicators:
+            df["sentiment"] = self.fetch_news_sentiment()
+            required.append("sentiment")
+        row = df.iloc[-1]
+        if row[required].isna().any():
+            return None
+        feats = row[required + ["volume"]].values
+        return np.array(feats, dtype=float).reshape(1, -1)
+
+    # ------------------------------------------------------------------
+    def append_market_data(self, price: float, volume: float, bid: float, ask: float) -> None:
+        """Append market data to internal history."""
+        self.history_df.loc[len(self.history_df)] = [price, volume, bid, ask]
+        if len(self.history_df) > self.history_len + 50:
+            self.history_df = self.history_df.iloc[-(self.history_len + 50) :]
+        self.history_df.to_csv(self.price_file, index=False)
+
+    def compute_trade_amount(self) -> float:
+        """Return position size based on recent volatility."""
+        if len(self.history_df) < 10:
+            return self.trade_amount
+        vol = self.history_df["close"].pct_change().rolling(10).std().iloc[-1]
+        if pd.isna(vol) or vol == 0:
+            return self.trade_amount
+        factor = min(1.0, 0.02 / vol)
+        return self.trade_amount * factor
+
+    # ------------------------------------------------------------------
+    def update_model(self, price: float, volume: float, bid: float, ask: float) -> Optional[np.ndarray]:
+        """Update ML model with new market observation."""
+        self.append_market_data(price, volume, bid, ask)
+        if len(self.history_df) < self.history_len + 1:
+            return None
+        df = self.history_df.iloc[-(self.history_len + 1) :]
+        features = self.compute_features(df.iloc[:-1])
+        if features is None:
+            return None
+        label = 1 if df["close"].iloc[-1] > df["close"].iloc[-2] else 0
+        self.features_list.append(features.flatten())
+        self.labels_list.append(label)
+        if len(self.features_list) > self.history_len:
+            self.features_list.pop(0)
+            self.labels_list.pop(0)
+        X = np.array(self.features_list)
+        y = np.array(self.labels_list)
+        self.scaler.fit(X)
+        Xs = self.scaler.transform(X)
+        try:
+            do_full = (not self.model_initialized) or (
+                self.train_counter % self.retrain_interval == 0
+            )
+            if do_full:
+                if len(y) >= 20:
+                    if self.model_type == "xgb":
+                        params = {
+                            "n_estimators": [50, 100],
+                            "max_depth": [3, 5],
+                            "learning_rate": [0.05, 0.1],
+                        }
+                    elif self.model_type == "gb":
+                        params = {"n_estimators": [50, 100], "max_depth": [3, 5]}
+                    else:
+                        params = {"alpha": [0.0001, 0.001]}
+                    grid = GridSearchCV(self.model, params, cv=3, n_jobs=-1)
+                    grid.fit(Xs, y)
+                    self.model = grid.best_estimator_
+                    score = grid.best_score_
+                else:
+                    self.model.fit(Xs, y)
+                    score = (
+                        cross_val_score(self.model, Xs, y, cv=3).mean() if len(y) >= 3 else None
+                    )
+                if score is not None:
+                    logging.info("CV score: %.3f", score)
+            elif hasattr(self.model, "partial_fit"):
+                self.model.partial_fit(
+                    self.scaler.transform(features), [label], classes=np.array([0, 1])
+                )
+        except Exception as exc:
+            logging.warning("Model train error: %s", exc)
+        self.train_counter += 1
+        joblib.dump({"model": self.model, "scaler": self.scaler}, self.model_file)
+        self.model_initialized = True
+        latest = self.compute_features(df.iloc[-self.history_len :])
+        return self.scaler.transform(latest) if latest is not None else None
+
+    # ------------------------------------------------------------------
+    def get_market_data(self) -> tuple[float, float, float, float]:
+        """Fetch latest market data."""
+        for _ in range(self.max_retries):
+            try:
+                tick = self.session.get_tickers(category="spot", symbol=self.symbol)
+                ticker = tick["result"]["list"][0]
+                price = float(ticker["lastPrice"])
+                volume = float(ticker.get("turnover24h", 0))
+                ob = self.session.get_orderbook(category="spot", symbol=self.symbol, limit=1)
+                bid_qty = float(ob["result"]["b"][0][1])
+                ask_qty = float(ob["result"]["a"][0][1])
+                return price, volume, bid_qty, ask_qty
+            except Exception as exc:
+                logging.warning("Market data error: %s", exc)
+                time.sleep(1)
+        raise RuntimeError("Failed to fetch market data")
+
+    def place_order(self, side: str, qty: float, tp: Optional[float] = None, sl: Optional[float] = None):
+        simulate = not (self.api_key and self.api_secret)
+        if simulate:
+            logging.info("Simulated order: %s %s", side, qty)
+            return {"price": self.last_price, "qty": qty}
+        for _ in range(self.max_retries):
+            try:
+                return self.session.place_order(
+                    category="spot",
+                    symbol=self.symbol,
+                    side="Buy" if side.lower() == "buy" else "Sell",
+                    orderType="Market",
+                    qty=qty,
+                    takeProfit=tp,
+                    stopLoss=sl,
+                )
+            except Exception as exc:
+                logging.warning("Order error: %s", exc)
+                time.sleep(1)
+        raise RuntimeError("Failed to place order")
+
+    # ------------------------------------------------------------------
+    def open_long(self, price: float) -> None:
+        qty = self.compute_trade_amount() / price
+        self.place_order(
+            "buy",
+            qty,
+            tp=price * (1 + self.tp_percent / 100),
+            sl=price * (1 - self.sl_percent / 100),
+        )
+        self.position_price = price
+        self.position_amount = qty
+        self.trailing_price = (
+            price * (1 - self.trailing_percent / 100) if self.trailing_percent else None
+        )
+        self.log_trade("buy", price, qty, tp=self.tp_percent, sl=self.sl_percent)
+        self.send_telegram(f"Opened long {qty:.6f} {self.symbol} @ {price}")
+
+    def open_short(self, price: float) -> None:
+        qty = self.compute_trade_amount() / price
+        self.place_order(
+            "sell",
+            qty,
+            tp=price * (1 - self.tp_percent / 100),
+            sl=price * (1 + self.sl_percent / 100),
+        )
+        self.position_price = price
+        self.position_amount = -qty
+        self.trailing_price = (
+            price * (1 + self.trailing_percent / 100) if self.trailing_percent else None
+        )
+        self.log_trade("sell", price, qty, tp=self.tp_percent, sl=self.sl_percent)
+        self.send_telegram(f"Opened short {qty:.6f} {self.symbol} @ {price}")
+
+    def close_position(self, price: float) -> None:
+        if self.position_amount == 0:
+            return
+        side = "sell" if self.position_amount > 0 else "buy"
+        qty = abs(self.position_amount)
+        self.place_order(side, qty)
+        pnl = (price - self.position_price) * self.position_amount
+        self.update_pnl(pnl)
+        self.log_trade("close", price, qty, pnl)
+        self.send_telegram(f"Closed position {side} pnl={pnl:.2f}")
+        self.position_amount = 0
+        self.position_price = None
+        self.trailing_price = None
+
+    def handle_trailing(self, price: float) -> bool:
+        if self.trailing_price is None:
+            return False
+        if self.position_amount > 0:
+            if (
+                price > self.position_price
+                and price * (1 - self.trailing_percent / 100) > self.trailing_price
+            ):
+                self.trailing_price = price * (1 - self.trailing_percent / 100)
+            if price <= self.trailing_price:
+                return True
+        else:
+            if (
+                price < self.position_price
+                and price * (1 + self.trailing_percent / 100) < self.trailing_price
+            ):
+                self.trailing_price = price * (1 + self.trailing_percent / 100)
+            if price >= self.trailing_price:
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    def log_trade(
+        self,
+        side: str,
+        price: float,
+        qty: float,
+        pnl: float = 0.0,
+        tp: Optional[float] = None,
+        sl: Optional[float] = None,
+    ) -> None:
+        header = not os.path.exists(self.trade_file)
+        with open(self.trade_file, "a") as f:
+            if header:
+                f.write("time,side,price,qty,pnl,tp,sl\n")
+            f.write(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')},{side},{price},{qty},{pnl},{tp},{sl}\n"
+            )
+
+    def reset_daily_pnl(self) -> None:
+        today = time.strftime("%Y-%m-%d")
+        if today != self.daily_date:
+            self.daily_date = today
+            self.daily_pnl = 0.0
+
+    def update_pnl(self, profit: float) -> None:
+        self.daily_pnl += profit
+
+    # ------------------------------------------------------------------
+    def trade_cycle(self) -> None:
+        use_websocket = os.getenv("USE_WEBSOCKET", "0") == "1"
+        if use_websocket:
+            from pybit.unified_trading import WebSocket
+
+            def _cb(msg):
+                data = msg.get("data")
+                if isinstance(data, list):
+                    data = data[0]
+                lp = data.get("lastPrice") or data.get("lp")
+                if lp:
+                    self.last_price = float(lp)
+
+            ws = WebSocket("spot")
+            ws.ticker_stream(self.symbol, _cb)
+
+        while True:
+            self.reset_daily_pnl()
+            if self.daily_loss_limit and self.daily_pnl <= -self.daily_loss_limit:
+                logging.warning("Daily loss limit reached")
+                break
+            if self.daily_profit_limit and self.daily_pnl >= self.daily_profit_limit:
+                logging.info("Daily profit target reached")
+                break
+            if self.last_price is None:
+                price, vol, bid, ask = self.get_market_data()
+            else:
+                price = self.last_price
+                vol = 0
+                bid = ask = 0
+            features = self.update_model(price, vol, bid, ask)
+            if features is None:
+                time.sleep(self.interval)
+                continue
+            prob = self.model.predict_proba(features)[0][1]
+
+            if self.position_amount > 0:  # long
+                if (
+                    price >= self.position_price * (1 + self.tp_percent / 100)
+                    or price <= self.position_price * (1 - self.sl_percent / 100)
+                    or self.handle_trailing(price)
+                ):
+                    self.close_position(price)
+            elif self.position_amount < 0:  # short
+                if (
+                    price <= self.position_price * (1 - self.tp_percent / 100)
+                    or price >= self.position_price * (1 + self.sl_percent / 100)
+                    or self.handle_trailing(price)
+                ):
+                    self.close_position(price)
+            if self.position_amount == 0:
+                if prob > 0.55:
+                    self.open_long(price)
+                elif prob < 0.45:
+                    self.open_short(price)
+            time.sleep(self.interval)
 
 
 if __name__ == "__main__":
-    trade_cycle()
+    bot = TradingBot()
+    bot.trade_cycle()
