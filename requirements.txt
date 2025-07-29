@@ -1,0 +1,9 @@
+pandas
+scikit-learn
+xgboost
+pandas_ta
+pybit
+python-dotenv
+pyyaml
+joblib
+requests
