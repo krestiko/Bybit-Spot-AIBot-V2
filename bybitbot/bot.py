@@ -213,6 +213,8 @@ class TradingBot:
             required.append("sma")
         if "ema" in self.indicators:
             df["ema"] = ta.ema(df["close"], length=10)
+            required.append("ema")
+        if "adx" in self.indicators:
             adx = ta.adx(df["high"], df["low"], df["close"], length=14)
             df["adx"] = adx["ADX_14"]
             required.append("adx")
@@ -408,8 +410,6 @@ class TradingBot:
             tp=price * (1 - self.tp_percent / 100),
             sl=price * (1 + self.sl_percent / 100),
         )
-        filled = order.get("filledQty", qty) if order else qty
-         )
         filled = order.get("filledQty", qty) if order else qty
         self.position_price = price
         self.position_amount = -filled
