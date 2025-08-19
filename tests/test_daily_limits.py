@@ -1,6 +1,7 @@
 import pytest
 
 from bybitbot import TradingBot
+import asyncio
 
 
 def test_daily_loss_limit_stops_trading(monkeypatch):
@@ -11,7 +12,7 @@ def test_daily_loss_limit_stops_trading(monkeypatch):
     bot.update_pnl(-50)  # total -120 <= -100
     monkeypatch.setattr(bot, "get_market_data", lambda: pytest.fail("should not fetch data"))
     monkeypatch.setattr(bot, "update_model", lambda *a, **k: pytest.fail("should not update model"))
-    bot.trade_cycle(max_iterations=1)
+    asyncio.run(bot.trade_cycle(max_iterations=1))
 
 
 def test_daily_profit_limit_stops_trading(monkeypatch):
@@ -21,5 +22,5 @@ def test_daily_profit_limit_stops_trading(monkeypatch):
     bot.update_pnl(50)  # total 110 >= 100
     monkeypatch.setattr(bot, "get_market_data", lambda: pytest.fail("should not fetch data"))
     monkeypatch.setattr(bot, "update_model", lambda *a, **k: pytest.fail("should not update model"))
-    bot.trade_cycle(max_iterations=1)
+    asyncio.run(bot.trade_cycle(max_iterations=1))
 
