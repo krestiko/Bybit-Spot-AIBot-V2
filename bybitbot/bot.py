@@ -5,7 +5,8 @@ from typing import List, Optional
 
 import joblib
 import numpy as np
-np.NaN = np.nan  # compatibility for pandas_ta
+if not hasattr(np, "NaN"):  # compatibility for pandas_ta on NumPy>=2
+    np.NaN = np.nan
 import pandas as pd
 import pandas_ta as ta
 import requests
@@ -44,6 +45,7 @@ class TradingBot:
         self.save_interval = int(os.getenv("SAVE_INTERVAL", 10))
         self.trailing_percent = float(os.getenv("TRAILING_PERCENT", 0))
         self.model_type = self.config.get("trade", {}).get("model_type", os.getenv("MODEL_TYPE", "gb"))
+        self.model_save_interval = int(os.getenv("MODEL_SAVE_INTERVAL", 10))
         self.daily_loss_limit = float(os.getenv("DAILY_STOP_LOSS", 0))
         self.daily_profit_limit = float(os.getenv("DAILY_TAKE_PROFIT", 0))
         self.indicators: List[str] = self.config.get(
@@ -71,6 +73,12 @@ class TradingBot:
 
         self.session = HTTP(api_key=self.api_key, api_secret=self.api_secret)
         self.last_price: Optional[float] = None
+        self.last_volume: Optional[float] = None
+        self.last_bid_qty: float = 0.0
+        self.last_ask_qty: float = 0.0
+
+        self.long_threshold = float(os.getenv("LONG_THRESHOLD", 0.55))
+        self.short_threshold = float(os.getenv("SHORT_THRESHOLD", 0.45))
 
     @staticmethod
     def _load_config(path: str) -> dict:
@@ -81,7 +89,22 @@ class TradingBot:
 
     def _init_model(self) -> None:
         if os.path.exists(self.model_file):
-@@ -160,130 +161,117 @@ class TradingBot:
+            saved = joblib.load(self.model_file)
+            self.model = saved.get("model")
+            self.scaler = saved.get("scaler", self.scaler)
+            self.model_initialized = True
+        else:
+            if self.model_type == "xgb":
+                self.model = XGBClassifier(use_label_encoder=False, eval_metric="logloss")
+            elif self.model_type == "gb":
+                self.model = GradientBoostingClassifier()
+            else:
+                self.model = SGDClassifier(loss="log_loss")
+            self.model_initialized = False
+
+    # ------------------------------------------------------------------
+    def send_telegram(self, msg: str) -> None:
+@@ -160,155 +169,172 @@ class TradingBot:
             stoch = ta.stoch(df["close"])
             df["stoch_k"] = stoch["STOCHk_14_3_3"]
             df["stoch_d"] = stoch["STOCHd_14_3_3"]
@@ -137,9 +160,9 @@ class TradingBot:
         if len(self.features_list) > self.history_len:
             self.features_list.pop(0)
             self.labels_list.pop(0)
+        self.scaler.partial_fit(features)
         X = np.array(self.features_list)
         y = np.array(self.labels_list)
-        self.scaler.fit(X)
         Xs = self.scaler.transform(X)
         try:
             if not self.model_initialized:
@@ -152,8 +175,16 @@ class TradingBot:
                 self.model.fit(Xs, y)
         except Exception as exc:
             logging.warning("Model train error: %s", exc)
+        if len(Xs) and hasattr(self.model, "predict"):
+            try:
+                preds = self.model.predict(Xs)
+                acc = float((preds == y).mean())
+                logging.info("Training accuracy: %.3f", acc)
+            except Exception:
+                pass
         self.train_counter += 1
-        joblib.dump({"model": self.model, "scaler": self.scaler}, self.model_file)
+        if self.train_counter % self.model_save_interval == 0:
+            joblib.dump({"model": self.model, "scaler": self.scaler}, self.model_file)
         self.model_initialized = True
         latest = self.compute_features(df.iloc[-self.history_len :])
         return self.scaler.transform(latest) if latest is not None else None
@@ -188,9 +219,22 @@ class TradingBot:
         if simulate:
             logging.info("Simulated order: %s %s", side, qty)
             return {"price": self.last_price, "qty": qty}
+
+        base, quote = self.symbol[:-4], self.symbol[-4:]
+        price = self.last_price or 0
+        try:
+            bal = self.session.get_wallet_balance(accountType="spot", coin=quote if side.lower() == "buy" else base)
+            avail = float(bal["result"]["list"][0]["availableBalance"])
+            needed = qty * price if side.lower() == "buy" else qty
+            if avail < needed:
+                logging.warning("Insufficient balance: have %s need %s", avail, needed)
+                return None
+        except Exception as exc:
+            logging.warning("Balance check error: %s", exc)
+
         for _ in range(self.max_retries):
             try:
-                return self.session.place_order(
+                order = self.session.place_order(
                     category="spot",
                     symbol=self.symbol,
                     side="Buy" if side.lower() == "buy" else "Sell",
@@ -199,11 +243,67 @@ class TradingBot:
                     takeProfit=tp,
                     stopLoss=sl,
                 )
-@@ -393,53 +381,52 @@ class TradingBot:
+                order_id = order.get("result", {}).get("orderId")
+                if order_id:
+                    try:
+                        status = self.session.get_order(category="spot", symbol=self.symbol, orderId=order_id)
+                        ord_info = status.get("result", {}).get("list", [{}])[0]
+                        logging.info("Order status: %s", ord_info.get("orderStatus"))
+                    except Exception as exc:
+                        logging.warning("Order status error: %s", exc)
+                return order
+            except Exception as exc:
+                logging.warning("Order error: %s", exc)
+                time.sleep(1)
+        raise RuntimeError("Failed to place order")
+
+    # ------------------------------------------------------------------
+    def open_long(self, price: float) -> None:
+        qty = self.compute_trade_amount() / price
+        self.place_order(
+            "buy",
+            qty,
+            tp=price * (1 + self.tp_percent / 100),
+            sl=price * (1 - self.sl_percent / 100),
+        )
+        self.position_price = price
+        self.position_amount = qty
+        self.trailing_price = (
+            price * (1 - self.trailing_percent / 100) if self.trailing_percent else None
+        )
+        self.log_trade("buy", price, qty, tp=self.tp_percent, sl=self.sl_percent)
+        self.send_telegram(f"Opened long {qty:.6f} {self.symbol} @ {price}")
+
+    def open_short(self, price: float) -> None:
+        qty = self.compute_trade_amount() / price
+        self.place_order(
+@@ -371,81 +397,106 @@ class TradingBot:
+        sl: Optional[float] = None,
+    ) -> None:
+        header = not os.path.exists(self.trade_file)
+        with open(self.trade_file, "a") as f:
+            if header:
+                f.write("time,side,price,qty,pnl,tp,sl\n")
+            f.write(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')},{side},{price},{qty},{pnl},{tp},{sl}\n"
+            )
+
+    def reset_daily_pnl(self) -> None:
+        today = time.strftime("%Y-%m-%d")
+        if today != self.daily_date:
+            self.daily_date = today
+            self.daily_pnl = 0.0
+
+    def update_pnl(self, profit: float) -> None:
+        self.daily_pnl += profit
+
+    # ------------------------------------------------------------------
+    def trade_cycle(self) -> None:
+        use_websocket = os.getenv("USE_WEBSOCKET", "0") == "1"
         if use_websocket:
             from pybit.unified_trading import WebSocket
 
-            def _cb(msg):
+            def _ticker_cb(msg):
                 data = msg.get("data")
                 if isinstance(data, list):
                     data = data[0]
@@ -211,8 +311,32 @@ class TradingBot:
                 if lp:
                     self.last_price = float(lp)
 
+            def _kline_cb(msg):
+                data = msg.get("data")
+                if isinstance(data, list):
+                    data = data[0]
+                vol = data.get("volume") or data.get("v")
+                if vol:
+                    self.last_volume = float(vol)
+
+            def _order_cb(msg):
+                data = msg.get("data")
+                if isinstance(data, list):
+                    data = data[0]
+                bids = data.get("b") or data.get("bid")
+                asks = data.get("a") or data.get("ask")
+                try:
+                    if bids:
+                        self.last_bid_qty = float(bids[0][1])
+                    if asks:
+                        self.last_ask_qty = float(asks[0][1])
+                except Exception:
+                    pass
+
             ws = WebSocket("spot")
-            ws.ticker_stream(self.symbol, _cb)
+            ws.ticker_stream(self.symbol, _ticker_cb)
+            ws.kline_stream(self.symbol, "1", _kline_cb)
+            ws.orderbook_stream(self.symbol, 1, _order_cb)
 
         while True:
             self.reset_daily_pnl()
@@ -222,11 +346,13 @@ class TradingBot:
             if self.daily_profit_limit and self.daily_pnl >= self.daily_profit_limit:
                 logging.info("Daily profit target reached")
                 break
-            if self.last_price is None:
-                price, vol, bid, ask = self.get_market_data()
-            else:
-                _, vol, bid, ask = self.get_market_data()
+            if use_websocket and self.last_price is not None and self.last_volume is not None:
                 price = self.last_price
+                vol = self.last_volume
+                bid = self.last_bid_qty
+                ask = self.last_ask_qty
+            else:
+                price, vol, bid, ask = self.get_market_data()
             features = self.update_model(price, vol, bid, ask)
             if features is None:
                 time.sleep(self.interval)
@@ -248,7 +374,13 @@ class TradingBot:
                 ):
                     self.close_position(price)
             if self.position_amount == 0:
-                if prob > 0.55:
+                if prob > self.long_threshold:
                     self.open_long(price)
-                elif prob < 0.45:
+                elif prob < self.short_threshold:
                     self.open_short(price)
+            time.sleep(self.interval)
+
+
+if __name__ == "__main__":
+    bot = TradingBot()
+    bot.trade_cycle()
