@@ -84,7 +84,7 @@ def _make_dataframe(size: int = 60) -> pd.DataFrame:
 
 @pytest.mark.parametrize(
     "inds, expected_len, has_news",
-    [(["ema"], 3, False), (["ema", "news"], 4, True), (["ema", "adx", "news"], 4, True)],
+    [(["ema"], 3, False), (["ema", "news"], 4, True), (["ema", "adx", "news"], 5, True)],
 )
 def test_compute_features_combinations(inds, expected_len, has_news, monkeypatch):
     df = _make_dataframe()
@@ -95,4 +95,4 @@ def test_compute_features_combinations(inds, expected_len, has_news, monkeypatch
     assert feats is not None
     assert feats.shape == (1, expected_len)
     if has_news:
-        assert feats[0, 2] == 0.5
+        assert feats[0, -2] == 0.5
