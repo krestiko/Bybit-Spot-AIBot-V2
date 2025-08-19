@@ -12,6 +12,7 @@ def test_open_short_and_close_position(tmp_path):
     bot.send_telegram = lambda msg: None
     bot._round_qty = lambda x: x
     bot.trailing_percent = 1.0
+    bot.qty_step = 0.01
 
     open_price = 100.0
     bot.open_short(open_price)
