@@ -1,4 +1,4 @@
-mport os
+import os
 import sys
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
@@ -16,6 +16,7 @@ def test_compute_trade_amount_basic():
             bid=1,
             ask=1,
         )
-    amt = bot.compute_trade_amount()
-    assert amt <= bot.trade_amount
-    assert amt > 0
+    price = bot.history_df["close"].iloc[-1]
+    qty = bot.compute_trade_amount(price)
+    assert qty <= bot.trade_amount / price
+    assert qty > 0
