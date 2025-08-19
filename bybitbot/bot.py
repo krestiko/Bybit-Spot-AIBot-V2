@@ -409,8 +409,6 @@ class TradingBot:
             sl=price * (1 + self.sl_percent / 100),
         )
         filled = order.get("filledQty", qty) if order else qty
-         )
-        filled = order.get("filledQty", qty) if order else qty
         self.position_price = price
         self.position_amount = -filled
         self.trailing_price = (

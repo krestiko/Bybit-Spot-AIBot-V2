@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 from bybitbot import TradingBot
 
 
@@ -33,3 +34,31 @@ def test_bid_ask_zero_division():
     feats = bot.compute_features(df)
     assert feats is not None
     assert not pd.isna(feats).any()
+
+
+def _make_dataframe(size: int = 60) -> pd.DataFrame:
+    data = {
+        "close": list(range(1, size + 1)),
+        "high": [x + 0.5 for x in range(1, size + 1)],
+        "low": [x - 0.5 for x in range(1, size + 1)],
+        "volume": [1] * size,
+        "bid_qty": [1] * size,
+        "ask_qty": [1] * size,
+    }
+    return pd.DataFrame(data)
+
+
+@pytest.mark.parametrize(
+    "inds, expected_len, has_news",
+    [(["ema"], 3, False), (["ema", "news"], 4, True), (["ema", "adx", "news"], 4, True)],
+)
+def test_compute_features_combinations(inds, expected_len, has_news, monkeypatch):
+    df = _make_dataframe()
+    bot = TradingBot()
+    bot.indicators = inds
+    monkeypatch.setattr(bot, "fetch_news_sentiment", lambda: 0.5)
+    feats = bot.compute_features(df)
+    assert feats is not None
+    assert feats.shape == (1, expected_len)
+    if has_news:
+        assert feats[0, 2] == 0.5
