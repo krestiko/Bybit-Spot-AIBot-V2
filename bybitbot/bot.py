@@ -37,6 +37,11 @@ class TradingBot:
         self.api_secret = os.getenv("BYBIT_API_SECRET")
         self.symbol = os.getenv("SYMBOL", "BTCUSDT")
         self.trade_amount = float(os.getenv("TRADE_AMOUNT_USDT", 10))
+        self.min_trade_amount = float(
+            self.config.get("trade", {}).get(
+                "min_trade_amount", os.getenv("MIN_TRADE_AMOUNT_USDT", 1)
+            )
+        )
         self.tp_percent = float(
             self.config.get("trade", {}).get("tp_percent", os.getenv("TP_PERCENT", 1.5))
         )
@@ -302,12 +307,12 @@ class TradingBot:
     def compute_trade_amount(self) -> float:
         """Return position size based on recent volatility."""
         if len(self.history_df) < 10:
-            return self.trade_amount
+            return max(self.min_trade_amount, self.trade_amount)
         vol = self.history_df["close"].pct_change().rolling(10).std().iloc[-1]
         if pd.isna(vol) or vol == 0:
-            return self.trade_amount
+            return max(self.min_trade_amount, self.trade_amount)
         factor = min(1.0, 0.02 / vol)
-        return self.trade_amount * factor
+        return max(self.min_trade_amount, self.trade_amount * factor)
 
     # ------------------------------------------------------------------
     def update_model(
@@ -439,6 +444,11 @@ class TradingBot:
     # ------------------------------------------------------------------
     def open_long(self, price: float) -> None:
         qty = self._round_qty(self.compute_trade_amount() / price)
+        if qty < self.qty_step:
+            logging.warning(
+                "Computed quantity %s below qty_step %s", qty, self.qty_step
+            )
+            return
         order = self.place_order(
             "buy",
             qty,
@@ -456,6 +466,11 @@ class TradingBot:
 
     def open_short(self, price: float) -> None:
         qty = self._round_qty(self.compute_trade_amount() / price)
+        if qty < self.qty_step:
+            logging.warning(
+                "Computed quantity %s below qty_step %s", qty, self.qty_step
+            )
+            return
         order = self.place_order(
             "sell",
             qty,
