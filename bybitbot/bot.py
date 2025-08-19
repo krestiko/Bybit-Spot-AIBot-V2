@@ -149,7 +149,7 @@ class TradingBot:
             self.model_initialized = False
 
     # ------------------------------------------------------------------
-    def send_telegram(self, msg: str) -> None:
+    def send_telegram(self, msg: str, timeout: int = 5) -> None:
         """Send message to telegram if credentials configured."""
         if not self.telegram_token or not self.telegram_chat_id:
             return
@@ -157,8 +157,11 @@ class TradingBot:
             requests.post(
                 f"https://api.telegram.org/bot{self.telegram_token}/sendMessage",
                 data={"chat_id": self.telegram_chat_id, "text": msg},
+                timeout=timeout,
             )
-        except Exception as exc:  # pragma: no cover - network issues
+        except requests.Timeout:
+            logging.warning("Telegram send timeout")
+        except requests.RequestException as exc:  # pragma: no cover - network issues
             logging.warning("Telegram error: %s", exc)
 
     def fetch_news_sentiment(self) -> float:
@@ -408,8 +411,6 @@ class TradingBot:
             tp=price * (1 - self.tp_percent / 100),
             sl=price * (1 + self.sl_percent / 100),
         )
-        filled = order.get("filledQty", qty) if order else qty
-         )
         filled = order.get("filledQty", qty) if order else qty
         self.position_price = price
         self.position_amount = -filled
