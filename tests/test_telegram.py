@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import requests
 
@@ -18,7 +19,7 @@ def test_send_telegram_timeout(monkeypatch, caplog):
     monkeypatch.setattr(requests, "post", fake_post)
 
     with caplog.at_level(logging.WARNING):
-        bot.send_telegram("hi")
+        asyncio.run(bot.send_telegram("hi"))
 
     assert captured["timeout"] == 5
     assert "Telegram send timeout" in caplog.text
