@@ -54,7 +54,7 @@ class TradingBot:
         self.model_save_interval = int(os.getenv("MODEL_SAVE_INTERVAL", 10))
         self.daily_loss_limit = float(os.getenv("DAILY_STOP_LOSS", 0))
         self.daily_profit_limit = float(os.getenv("DAILY_TAKE_PROFIT", 0))
-        self.indicators: List[str] = self.config.get(
+        self._indicators: List[str] = self.config.get(
             "indicators",
             ["rsi", "macd", "bb", "sma", "ema", "adx", "stoch", "obv"],
         )
@@ -95,6 +95,17 @@ class TradingBot:
 
         self.long_threshold = float(os.getenv("LONG_THRESHOLD", 0.55))
         self.short_threshold = float(os.getenv("SHORT_THRESHOLD", 0.45))
+
+    @property
+    def indicators(self) -> List[str]:
+        return self._indicators
+
+    @indicators.setter
+    def indicators(self, value: List[str]) -> None:
+        self._indicators = value
+        self.features_list.clear()
+        self.labels_list.clear()
+        self.scaler = StandardScaler()
 
     @staticmethod
     def _load_config(path: str) -> dict:
@@ -246,6 +257,28 @@ class TradingBot:
         if "news" in self.indicators:
             df["sentiment"] = self.fetch_news_sentiment()
             required.append("sentiment")
+        feature_counts = {
+            "rsi": 1,
+            "macd": 1,
+            "bb": 2,
+            "sma": 1,
+            "ema": 1,
+            "adx": 1,
+            "stoch": 2,
+            "obv": 1,
+            "news": 1,
+        }
+        expected = 1
+        for ind in self.indicators:
+            if ind not in feature_counts:
+                logging.warning("Unknown indicator: %s", ind)
+                return None
+            expected += feature_counts[ind]
+        if len(required) != expected:
+            logging.warning(
+                "Indicator feature mismatch: expected %d, got %d", expected, len(required)
+            )
+            return None
         row = df.iloc[-1]
         if row[required].isna().any():
             return None
