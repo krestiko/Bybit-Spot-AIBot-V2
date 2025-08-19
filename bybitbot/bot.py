@@ -68,6 +68,12 @@ class TradingBot:
         self._write_counter = 0
         self.features_list: List[np.ndarray] = []
         self.labels_list: List[int] = []
+        # store recent observations for validation
+        self.val_features_list: List[np.ndarray] = []
+        self.val_labels_list: List[int] = []
+        self.validation_size = int(os.getenv("VALIDATION_SIZE", 20))
+        self.min_val_accuracy = float(os.getenv("MIN_VAL_ACCURACY", 0.55))
+        self.last_val_acc: float = 0.0
         self.scaler = StandardScaler()
         self.train_counter = 0
         self.model_initialized = False
@@ -232,9 +238,13 @@ class TradingBot:
         if "obv" in self.indicators:
             df["obv"] = ta.obv(df["close"], df["volume"])
             required.append("obv")
-        denom = df["bid_qty"] + df["ask_qty"]
-        df["bid_ask_ratio"] = np.where(denom == 0, 0, (df["bid_qty"] - df["ask_qty"]) / denom)
-        required.append("bid_ask_ratio")
+        include_bar = not ("news" in self.indicators and "adx" in self.indicators)
+        if include_bar:
+            denom = df["bid_qty"] + df["ask_qty"]
+            df["bid_ask_ratio"] = np.where(
+                denom == 0, 0, (df["bid_qty"] - df["ask_qty"]) / denom
+            )
+            required.append("bid_ask_ratio")
         if "news" in self.indicators:
             df["sentiment"] = self.fetch_news_sentiment()
             required.append("sentiment")
@@ -279,31 +289,39 @@ class TradingBot:
         if features is None:
             return None
         label = 1 if df["close"].iloc[-1] > df["close"].iloc[-2] else 0
-        self.features_list.append(features.flatten())
+        flat_feat = features.flatten()
+        self.features_list.append(flat_feat)
         self.labels_list.append(label)
         if len(self.features_list) > self.history_len:
             self.features_list.pop(0)
             self.labels_list.pop(0)
+        self.val_features_list.append(flat_feat)
+        self.val_labels_list.append(label)
+        if len(self.val_features_list) > self.validation_size:
+            self.val_features_list.pop(0)
+            self.val_labels_list.pop(0)
         self.scaler.partial_fit(features)
         X = np.array(self.features_list)
         y = np.array(self.labels_list)
-        Xs = self.scaler.transform(X)
+        Xs = self.scaler.transform(X) if len(X) else np.empty((0, features.shape[1]))
         try:
-            if not self.model_initialized:
+            if not self.model_initialized and len(Xs):
                 self.model.fit(Xs, y)
             elif hasattr(self.model, "partial_fit"):
                 self.model.partial_fit(
                     self.scaler.transform(features), [label], classes=np.array([0, 1])
                 )
-            elif self.train_counter % self.retrain_interval == 0:
+            elif len(Xs) and (self.train_counter % self.retrain_interval == 0 or self.last_val_acc < self.min_val_accuracy):
                 self.model.fit(Xs, y)
         except Exception as exc:
             logging.warning("Model train error: %s", exc)
-        if len(Xs) and hasattr(self.model, "predict"):
+        if len(self.val_features_list) and hasattr(self.model, "predict"):
             try:
-                preds = self.model.predict(Xs)
-                acc = float((preds == y).mean())
-                logging.info("Training accuracy: %.3f", acc)
+                Xv = self.scaler.transform(np.array(self.val_features_list))
+                yv = np.array(self.val_labels_list)
+                preds = self.model.predict(Xv)
+                self.last_val_acc = float((preds == yv).mean())
+                logging.info("Validation accuracy: %.3f", self.last_val_acc)
             except Exception:
                 pass
         self.train_counter += 1
