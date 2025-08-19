@@ -261,7 +261,7 @@ class TradingBot:
                 ticker = tick["result"]["list"][0]
                 price = float(ticker["lastPrice"])
                 high = price
-                low = price
+                    low = price
                 try:
                     kl = self.session.get_kline(
                         category="spot", symbol=self.symbol, interval="1", limit=1
@@ -286,13 +286,38 @@ class TradingBot:
                 time.sleep(1)
         raise RuntimeError("Failed to fetch market data")
 
+    def _get_base_quote(self) -> tuple[str, str]:
+        """Determine base and quote currencies for the current symbol.
+
+        Tries to fetch instrument information from the exchange and falls
+        back to splitting by common quote suffixes if that fails.
+        """
+        try:
+            info = self.session.get_instruments_info(
+                category="spot", symbol=self.symbol
+            )
+            items = info.get("result", {}).get("list", [])
+            if items:
+                inst = items[0]
+                base = inst.get("baseCoin")
+                quote = inst.get("quoteCoin")
+                if base and quote:
+                    return base, quote
+        except Exception as exc:
+            logging.warning("Instrument info error: %s", exc)
+
+        known_suffixes = ["USDT", "USDC", "BTC", "ETH", "EUR", "GBP"]
+        for suffix in known_suffixes:
+            if self.symbol.endswith(suffix):
+                return self.symbol[: -len(suffix)], suffix
+        raise RuntimeError(f"Unable to determine base/quote for {self.symbol}")
+
     def place_order(self, side: str, qty: float, tp: Optional[float] = None, sl: Optional[float] = None):
         simulate = not (self.api_key and self.api_secret)
         if simulate:
             logging.info("Simulated order: %s %s", side, qty)
             return {"price": self.last_price, "qty": qty}
-
-        base, quote = self.symbol[:-4], self.symbol[-4:]
+        base, quote = self._get_base_quote()
         price = self.last_price or 0
         try:
             bal = self.session.get_wallet_balance(accountType="spot", coin=quote if side.lower() == "buy" else base)
@@ -306,7 +331,18 @@ class TradingBot:
 
         for _ in range(self.max_retries):
             try:
-@@ -253,127 +327,178 @@ class TradingBot:
+                params = {
+                    "category": "spot",
+                    "symbol": self.symbol,
+                    "side": side.upper(),
+                    "orderType": "Market",
+                    "qty": str(qty),
+                }
+                if tp is not None:
+                    params["takeProfit"] = str(tp)
+                if sl is not None:
+                    params["stopLoss"] = str(sl)
+                return self.session.place_order(**params)
             except Exception as exc:
                 logging.warning("Order error: %s", exc)
                 time.sleep(1)
@@ -332,156 +368,3 @@ class TradingBot:
     def open_short(self, price: float) -> None:
         qty = self.compute_trade_amount() / price
         self.place_order(
-            "sell",
-            qty,
-            tp=price * (1 - self.tp_percent / 100),
-            sl=price * (1 + self.sl_percent / 100),
-        )
-        self.position_price = price
-        self.position_amount = -qty
-        self.trailing_price = (
-            price * (1 + self.trailing_percent / 100) if self.trailing_percent else None
-        )
-        self.log_trade("sell", price, qty, tp=self.tp_percent, sl=self.sl_percent)
-        self.send_telegram(f"Opened short {qty:.6f} {self.symbol} @ {price}")
-
-    def close_position(self, price: float) -> None:
-        if self.position_amount == 0:
-            return
-        side = "sell" if self.position_amount > 0 else "buy"
-        qty = abs(self.position_amount)
-        self.place_order(side, qty)
-        pnl = (price - (self.position_price or price)) * self.position_amount
-        self.update_pnl(pnl)
-        self.log_trade(side, price, qty, pnl)
-        self.position_price = None
-        self.position_amount = 0.0
-        self.trailing_price = None
-        self.send_telegram(
-            f"Closed position {side} {qty:.6f} @ {price} (PnL {pnl:.2f})"
-        )
-
-    def log_trade(
-        self,
-        side: str,
-        price: float,
-        qty: float,
-        pnl: float = 0.0,
-        tp: Optional[float] = None,
-        sl: Optional[float] = None,
-    ) -> None:
-        header = not os.path.exists(self.trade_file)
-        with open(self.trade_file, "a") as f:
-            if header:
-                f.write("time,side,price,qty,pnl,tp,sl\n")
-            f.write(
-                f"{time.strftime('%Y-%m-%d %H:%M:%S')},{side},{price},{qty},{pnl},{tp},{sl}\n"
-            )
-
-    def reset_daily_pnl(self) -> None:
-        today = time.strftime("%Y-%m-%d")
-        if today != self.daily_date:
-            self.daily_date = today
-            self.daily_pnl = 0.0
-
-    def update_pnl(self, profit: float) -> None:
-        self.daily_pnl += profit
-
-    # ------------------------------------------------------------------
-    def trade_cycle(self) -> None:
-        use_websocket = os.getenv("USE_WEBSOCKET", "0") == "1"
-        if use_websocket:
-            from pybit.unified_trading import WebSocket
-
-            def _ticker_cb(msg):
-                data = msg.get("data")
-                if isinstance(data, list):
-                    data = data[0]
-                lp = data.get("lastPrice") or data.get("lp")
-                if lp:
-                    self.last_price = float(lp)
-
-            def _kline_cb(msg):
-                data = msg.get("data")
-                if isinstance(data, list):
-                    data = data[0]
-                vol = data.get("volume") or data.get("v")
-                if vol:
-                    self.last_volume = float(vol)
-                hi = data.get("high") or data.get("h")
-                lo = data.get("low") or data.get("l")
-                close = data.get("close") or data.get("c")
-                if hi is not None:
-                    self.last_high = float(hi)
-                if lo is not None:
-                    self.last_low = float(lo)
-                if close is not None:
-                    self.last_price = float(close)
-
-            def _order_cb(msg):
-                data = msg.get("data")
-                if isinstance(data, list):
-                    data = data[0]
-                bids = data.get("b") or data.get("bid")
-                asks = data.get("a") or data.get("ask")
-                try:
-                    if bids:
-                        self.last_bid_qty = float(bids[0][1])
-                    if asks:
-                        self.last_ask_qty = float(asks[0][1])
-                except Exception:
-                    pass
-
-            ws = WebSocket("spot")
-            ws.ticker_stream(self.symbol, _ticker_cb)
-            ws.kline_stream(self.symbol, "1", _kline_cb)
-            ws.orderbook_stream(self.symbol, 1, _order_cb)
-
-        while True:
-            self.reset_daily_pnl()
-            if self.daily_loss_limit and self.daily_pnl <= -self.daily_loss_limit:
-                logging.warning("Daily loss limit reached")
-                break
-            if self.daily_profit_limit and self.daily_pnl >= self.daily_profit_limit:
-                logging.info("Daily profit target reached")
-                break
-            if use_websocket and None not in (
-                self.last_price,
-                self.last_high,
-                self.last_low,
-                self.last_volume,
-            ):
-                price = self.last_price  # type: ignore[assignment]
-                high = self.last_high  # type: ignore[assignment]
-                low = self.last_low  # type: ignore[assignment]
-                vol = self.last_volume  # type: ignore[assignment]
-                bid = self.last_bid_qty
-                ask = self.last_ask_qty
-            else:
-                price, high, low, vol, bid, ask = self.get_market_data()
-            features = self.update_model(price, high, low, vol, bid, ask)
-            if features is None:
-                time.sleep(self.interval)
-                continue
-            prob = self.model.predict_proba(features)[0][1]
-
-            if self.position_amount > 0:  # long
-                if (
-                    price >= self.position_price * (1 + self.tp_percent / 100)
-                    or price <= self.position_price * (1 - self.sl_percent / 100)
-                    or self.handle_trailing(price)
-                ):
-                    self.close_position(price)
-            elif self.position_amount < 0:  # short
-                if (
-                    price <= self.position_price * (1 - self.tp_percent / 100)
-                    or price >= self.position_price * (1 + self.sl_percent / 100)
-                    or self.handle_trailing(price)
-                ):
-                    self.close_position(price)
-            if self.position_amount == 0:
-                if prob > self.long_threshold:
-                    self.open_long(price)
-                elif prob < self.short_threshold:
-                    self.open_short(price)
-            time.sleep(self.interval)
