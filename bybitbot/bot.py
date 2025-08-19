@@ -1,6 +1,7 @@
 import os
 import time
 import logging
+import asyncio
 from typing import List, Optional
 
 import joblib
@@ -557,7 +558,7 @@ class TradingBot:
         self.daily_pnl += profit
 
     # ------------------------------------------------------------------
-    def trade_cycle(self, max_iterations: Optional[int] = None) -> None:
+    async def trade_cycle(self, max_iterations: Optional[int] = None) -> None:
         use_websocket = os.getenv("USE_WEBSOCKET", "0") == "1"
         if use_websocket:
             from pybit.unified_trading import WebSocket
@@ -627,10 +628,14 @@ class TradingBot:
                     bid = self.last_bid_qty
                     ask = self.last_ask_qty
                 else:
-                    price, high, low, vol, bid, ask = self.get_market_data()
-                features = self.update_model(price, high, low, vol, bid, ask)
+                    price, high, low, vol, bid, ask = await asyncio.to_thread(
+                        self.get_market_data
+                    )
+                features = await asyncio.to_thread(
+                    self.update_model, price, high, low, vol, bid, ask
+                )
                 if features is None:
-                    time.sleep(self.interval)
+                    await asyncio.sleep(self.interval)
                     continue
                 prob = self.model.predict_proba(features)[0][1]
 
@@ -655,10 +660,13 @@ class TradingBot:
                         self.open_long(price)
                     elif prob < self.short_threshold:
                         self.open_short(price)
-                time.sleep(self.interval)
+                await asyncio.sleep(self.interval)
                 iteration += 1
                 if max_iterations is not None and iteration >= max_iterations:
                     break
+        except asyncio.CancelledError:
+            logging.info("Trading loop cancelled")
+            raise
         except KeyboardInterrupt:
             logging.info("Trading loop interrupted by user")
         except Exception as exc:
@@ -667,4 +675,4 @@ class TradingBot:
 
 if __name__ == "__main__":
     bot = TradingBot()
-    bot.trade_cycle()
+    asyncio.run(bot.trade_cycle())
