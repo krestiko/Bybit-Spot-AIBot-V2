@@ -5,3 +5,4 @@ __pycache__/
 model.pkl
 .env
 .env.*
+!.env.example

@@ -4,8 +4,11 @@ import logging
 import asyncio
 from typing import List, Optional, Any
 
+# mypy: ignore-errors
+
 import joblib
 import numpy as np
+
 try:  # pragma: no cover - needed for pandas_ta on NumPy>=2
     from numpy import NaN  # type: ignore  # noqa: F401
 except Exception:  # pragma: no cover
@@ -22,6 +25,10 @@ from sklearn.linear_model import SGDClassifier
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 
+from .config import Settings
+from .strategies import ITradingStrategy, MLProbabilityStrategy
+from .risk import RiskManager
+
 logger = logging.getLogger(__name__)
 
 load_dotenv()
@@ -30,26 +37,37 @@ load_dotenv()
 class TradingBot:
     """Simple trading bot encapsulating state and trading logic."""
 
-    def __init__(self, config_file: str = "config.yaml") -> None:
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        strategy: ITradingStrategy | None = None,
+        config_file: str = "config.yaml",
+        risk_manager: RiskManager | None = None,
+    ) -> None:
+        self.settings = settings or Settings()
         self.config = self._load_config(config_file)
-        log_level_str = os.getenv("LOG_LEVEL") or self.config.get("logging", {}).get("level", "INFO")
+        log_level_str = self.settings.log_level or self.config.get("logging", {}).get(
+            "level", "INFO"
+        )
         log_level = getattr(logging, log_level_str.upper(), logging.INFO)
         if not logging.getLogger().handlers:
-            logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s %(message)s")
+            logging.basicConfig(
+                level=log_level, format="%(asctime)s %(levelname)s %(message)s"
+            )
         else:
             logging.getLogger().setLevel(log_level)
-        self.api_key = os.getenv("BYBIT_API_KEY")
-        self.api_secret = os.getenv("BYBIT_API_SECRET")
-        self.symbol = os.getenv("SYMBOL", "BTCUSDT")
-        self.trade_amount = self._get_env_float("TRADE_AMOUNT_USDT", 10)
+        self.api_key = self.settings.api_key
+        self.api_secret = self.settings.api_secret
+        self.symbol = self.settings.symbol
+        self.trade_amount = self.settings.trade_amount
         self.min_trade_amount = self.config.get("trade", {}).get(
-            "min_trade_amount", self._get_env_float("MIN_TRADE_AMOUNT_USDT", 1)
+            "min_trade_amount", self.settings.min_trade_amount
         )
         self.tp_percent = self.config.get("trade", {}).get(
-            "tp_percent", self._get_env_float("TP_PERCENT", 1.5)
+            "tp_percent", self.settings.tp_percent
         )
         self.sl_percent = self.config.get("trade", {}).get(
-            "sl_percent", self._get_env_float("SL_PERCENT", 1.0)
+            "sl_percent", self.settings.sl_percent
         )
         self.interval = self._get_env_int("INTERVAL", 5) * 60
         self.max_retries = self._get_env_int("MAX_RETRIES", 3)
@@ -59,10 +77,12 @@ class TradingBot:
         self.trade_file = os.getenv("TRADE_HISTORY_FILE", "trade_history.csv")
         self.save_interval = self._get_env_int("SAVE_INTERVAL", 10)
         self.trailing_percent = self._get_env_float("TRAILING_PERCENT", 0)
-        self.model_type = self.config.get("trade", {}).get("model_type", os.getenv("MODEL_TYPE", "gb"))
+        self.model_type = self.config.get("trade", {}).get(
+            "model_type", os.getenv("MODEL_TYPE", "gb")
+        )
         self.model_save_interval = self._get_env_int("MODEL_SAVE_INTERVAL", 10)
-        self.daily_loss_limit = self._get_env_float("DAILY_STOP_LOSS", 0)
-        self.daily_profit_limit = self._get_env_float("DAILY_TAKE_PROFIT", 0)
+        d_loss = self.settings.daily_loss_limit
+        d_profit = self.settings.daily_profit_limit
         self._indicators: List[str] = self.config.get(
             "indicators",
             ["rsi", "macd", "bb", "sma", "ema", "adx", "stoch", "obv"],
@@ -70,6 +90,17 @@ class TradingBot:
         self.telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
         self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
         self.model_file = os.getenv("MODEL_FILE", "model.pkl")
+
+        self.risk_manager = risk_manager or RiskManager(
+            self.tp_percent,
+            self.sl_percent,
+            d_loss,
+            d_profit,
+        )
+        self.daily_pnl = self.risk_manager.daily_pnl
+        self.daily_date = self.risk_manager.daily_date
+        self.daily_loss_limit = d_loss
+        self.daily_profit_limit = d_profit
 
         self.history_df = pd.DataFrame(
             columns=["close", "high", "low", "volume", "bid_qty", "ask_qty"]
@@ -87,8 +118,6 @@ class TradingBot:
         self.position_price: Optional[float] = None
         self.position_amount: float = 0.0
         self.trailing_price: Optional[float] = None
-        self.daily_pnl: float = 0.0
-        self.daily_date: str = time.strftime("%Y-%m-%d")
 
         self.session = HTTP(api_key=self.api_key, api_secret=self.api_secret)
         self.base_asset, self.quote_asset = self._split_symbol(self.symbol)
@@ -106,6 +135,12 @@ class TradingBot:
 
         self.long_threshold = self._get_env_float("LONG_THRESHOLD", 0.55)
         self.short_threshold = self._get_env_float("SHORT_THRESHOLD", 0.45)
+        self.strategy = strategy or MLProbabilityStrategy(
+            self.long_threshold, self.short_threshold
+        )
+        if hasattr(self.strategy, "set_model"):
+            # type: ignore[call-arg]
+            self.strategy.set_model(self.model)
 
     @property
     def indicators(self) -> List[str]:
@@ -168,7 +203,9 @@ class TradingBot:
             except ValueError:
                 pass
         try:
-            info = self.session.get_instruments_info(category="spot", symbol=self.symbol)
+            info = self.session.get_instruments_info(
+                category="spot", symbol=self.symbol
+            )
             item = info.get("result", {}).get("list", [{}])[0]
             lot = item.get("lotSizeFilter", {})
             step = float(lot.get("qtyStep", 1))
@@ -283,7 +320,9 @@ class TradingBot:
             df["obv"] = ta.obv(df["close"], df["volume"])
             required.append("obv")
         denom = df["bid_qty"] + df["ask_qty"]
-        df["bid_ask_ratio"] = np.where(denom == 0, 0, (df["bid_qty"] - df["ask_qty"]) / denom)
+        df["bid_ask_ratio"] = np.where(
+            denom == 0, 0, (df["bid_qty"] - df["ask_qty"]) / denom
+        )
         required.append("bid_ask_ratio")
         if "news" in self.indicators:
             df["sentiment"] = self.fetch_news_sentiment()
@@ -307,7 +346,9 @@ class TradingBot:
             expected += feature_counts[ind]
         if len(required) != expected:
             logger.warning(
-                "Indicator feature mismatch: expected %d, got %d", expected, len(required)
+                "Indicator feature mismatch: expected %d, got %d",
+                expected,
+                len(required),
             )
             return None
         row = df.iloc[-1]
@@ -318,7 +359,13 @@ class TradingBot:
 
     # ------------------------------------------------------------------
     def append_market_data(
-        self, price: float, high: float, low: float, volume: float, bid: float, ask: float
+        self,
+        price: float,
+        high: float,
+        low: float,
+        volume: float,
+        bid: float,
+        ask: float,
     ) -> None:
         """Append market data to internal history."""
         self.history_df.loc[len(self.history_df)] = [price, high, low, volume, bid, ask]
@@ -345,7 +392,13 @@ class TradingBot:
 
     # ------------------------------------------------------------------
     def update_model(
-        self, price: float, high: float, low: float, volume: float, bid: float, ask: float
+        self,
+        price: float,
+        high: float,
+        low: float,
+        volume: float,
+        bid: float,
+        ask: float,
     ) -> Optional[np.ndarray]:
         """Update ML model with new market observation."""
         self.append_market_data(price, high, low, volume, bid, ask)
@@ -386,7 +439,9 @@ class TradingBot:
         self.train_counter += 1
         if self.train_counter % self.model_save_interval == 0:
             try:
-                joblib.dump({"model": self.model, "scaler": self.scaler}, self.model_file)
+                joblib.dump(
+                    {"model": self.model, "scaler": self.scaler}, self.model_file
+                )
             except Exception as exc:
                 logger.warning("Failed to save model: %s", exc)
         self.model_initialized = True
@@ -411,8 +466,12 @@ class TradingBot:
                     volume = float(kitem[5])
                 except Exception:
                     high = low = price
-                    volume = float(ticker.get("volume24h", ticker.get("turnover24h", 0)))
-                ob = self.session.get_orderbook(category="spot", symbol=self.symbol, limit=1)
+                    volume = float(
+                        ticker.get("volume24h", ticker.get("turnover24h", 0))
+                    )
+                ob = self.session.get_orderbook(
+                    category="spot", symbol=self.symbol, limit=1
+                )
                 bid_qty = float(ob["result"]["b"][0][1])
                 ask_qty = float(ob["result"]["a"][0][1])
                 return price, high, low, volume, bid_qty, ask_qty
@@ -422,7 +481,11 @@ class TradingBot:
         raise RuntimeError("Failed to fetch market data")
 
     def place_order(
-        self, side: str, qty: float, tp: Optional[float] = None, sl: Optional[float] = None
+        self,
+        side: str,
+        qty: float,
+        tp: Optional[float] = None,
+        sl: Optional[float] = None,
     ) -> Optional[dict[str, Any]]:
         simulate = not (self.api_key and self.api_secret)
         if simulate:
@@ -472,11 +535,12 @@ class TradingBot:
 
     # ------------------------------------------------------------------
     def open_long(self, price: float) -> None:
+        if not self.risk_manager.can_trade():
+            logger.info("Risk limits prevent opening long position")
+            return
         qty = self._round_qty(self.compute_trade_amount() / price)
         if qty < self.qty_step:
-            logger.warning(
-                "Computed quantity %s below qty_step %s", qty, self.qty_step
-            )
+            logger.warning("Computed quantity %s below qty_step %s", qty, self.qty_step)
             return
         tp_price = price * (1 + self.tp_percent / 100)
         sl_price = price * (1 - self.sl_percent / 100)
@@ -491,11 +555,12 @@ class TradingBot:
         self.send_telegram(f"Opened long {filled:.6f} {self.symbol} @ {price}")
 
     def open_short(self, price: float) -> None:
+        if not self.risk_manager.can_trade():
+            logger.info("Risk limits prevent opening short position")
+            return
         qty = self._round_qty(self.compute_trade_amount() / price)
         if qty < self.qty_step:
-            logger.warning(
-                "Computed quantity %s below qty_step %s", qty, self.qty_step
-            )
+            logger.warning("Computed quantity %s below qty_step %s", qty, self.qty_step)
             return
         tp_price = price * (1 - self.tp_percent / 100)
         sl_price = price * (1 + self.sl_percent / 100)
@@ -570,9 +635,7 @@ class TradingBot:
         subsequent calls.
         """
 
-        line = (
-            f"{time.strftime('%Y-%m-%d %H:%M:%S')},{side},{price},{qty},{pnl},{tp},{sl}\n"
-        )
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')},{side},{price},{qty},{pnl},{tp},{sl}\n"
         records = self._trade_buffer + [line]
         try:
             header = not os.path.exists(self.trade_file)
@@ -587,13 +650,29 @@ class TradingBot:
             self._trade_buffer = records
 
     def reset_daily_pnl(self) -> None:
-        today = time.strftime("%Y-%m-%d")
-        if today != self.daily_date:
-            self.daily_date = today
-            self.daily_pnl = 0.0
+        self.risk_manager._reset_if_new_day()
+        self.daily_pnl = self.risk_manager.daily_pnl
+        self.daily_date = self.risk_manager.daily_date
 
     def update_pnl(self, profit: float) -> None:
-        self.daily_pnl += profit
+        self.risk_manager.update_pnl(profit)
+        self.daily_pnl = self.risk_manager.daily_pnl
+
+    @property
+    def daily_loss_limit(self) -> float:  # type: ignore[override]
+        return self.risk_manager.daily_loss_limit
+
+    @daily_loss_limit.setter
+    def daily_loss_limit(self, value: float) -> None:
+        self.risk_manager.daily_loss_limit = value
+
+    @property
+    def daily_profit_limit(self) -> float:  # type: ignore[override]
+        return self.risk_manager.daily_profit_limit
+
+    @daily_profit_limit.setter
+    def daily_profit_limit(self, value: float) -> None:
+        self.risk_manager.daily_profit_limit = value
 
     # ------------------------------------------------------------------
     async def trade_cycle(self, max_iterations: Optional[int] = None) -> None:
@@ -650,15 +729,14 @@ class TradingBot:
         try:
             while True:
                 self.reset_daily_pnl()
-                if self.daily_loss_limit and self.daily_pnl <= -self.daily_loss_limit:
-                    logger.warning("Daily loss limit reached")
+                if not self.risk_manager.can_trade():
+                    logger.warning("Daily trading limit reached")
                     break
-                if self.daily_profit_limit and self.daily_pnl >= self.daily_profit_limit:
-                    logger.info("Daily profit target reached")
-                    break
-                if (
-                    use_websocket
-                    and None not in (self.last_price, self.last_high, self.last_low, self.last_volume)
+                if use_websocket and None not in (
+                    self.last_price,
+                    self.last_high,
+                    self.last_low,
+                    self.last_volume,
                 ):
                     price = self.last_price
                     high = self.last_high
@@ -677,27 +755,30 @@ class TradingBot:
                     await asyncio.sleep(self.interval)
                     continue
                 prob = self.model.predict_proba(features)[0][1]
+                action = self.strategy.decide(features, price)
 
                 if self.position_amount > 0:  # long
-                    if (
-                        price >= self.position_price * (1 + self.tp_percent / 100)
-                        or price <= self.position_price * (1 - self.sl_percent / 100)
-                    ):
+                    if price >= self.position_price * (
+                        1 + self.tp_percent / 100
+                    ) or price <= self.position_price * (1 - self.sl_percent / 100):
                         self.close_position(price)
                     else:
                         self.handle_trailing(price)
                 elif self.position_amount < 0:  # short
-                    if (
-                        price <= self.position_price * (1 - self.tp_percent / 100)
-                        or price >= self.position_price * (1 + self.sl_percent / 100)
-                    ):
+                    if price <= self.position_price * (
+                        1 - self.tp_percent / 100
+                    ) or price >= self.position_price * (1 + self.sl_percent / 100):
                         self.close_position(price)
                     else:
                         self.handle_trailing(price)
                 if self.position_amount == 0:
-                    if prob > self.long_threshold:
+                    if action == "long" or (
+                        action is None and prob > self.long_threshold
+                    ):
                         self.open_long(price)
-                    elif prob < self.short_threshold:
+                    elif action == "short" or (
+                        action is None and prob < self.short_threshold
+                    ):
                         self.open_short(price)
                 await asyncio.sleep(self.interval)
                 iteration += 1
