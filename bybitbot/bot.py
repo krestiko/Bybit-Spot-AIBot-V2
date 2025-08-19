@@ -239,12 +239,13 @@ class TradingBot:
         self.model_initialized = False
 
     # ------------------------------------------------------------------
-    def send_telegram(self, msg: str, timeout: int = 5) -> None:
+    async def send_telegram(self, msg: str, timeout: int = 5) -> None:
         """Send message to telegram if credentials configured."""
         if not self.telegram_token or not self.telegram_chat_id:
             return
         try:
-            requests.post(
+            await asyncio.to_thread(
+                requests.post,
                 f"https://api.telegram.org/bot{self.telegram_token}/sendMessage",
                 data={"chat_id": self.telegram_chat_id, "text": msg},
                 timeout=timeout,
@@ -352,7 +353,7 @@ class TradingBot:
             )
             return None
         row = df.iloc[-1]
-        if row[required].isna().any():
+        if row[required + ["volume"]].isna().any():
             return None
         feats = row[required + ["volume"]].values
         return np.array(feats, dtype=float).reshape(1, -1)
@@ -480,7 +481,7 @@ class TradingBot:
                 time.sleep(1)
         raise RuntimeError("Failed to fetch market data")
 
-    def place_order(
+    async def place_order(
         self,
         side: str,
         qty: float,
@@ -495,7 +496,9 @@ class TradingBot:
         price = self.last_price or 0
         try:
             coin = self.quote_asset if side.lower() == "buy" else self.base_asset
-            bal = self.session.get_wallet_balance(accountType="spot", coin=coin)
+            bal = await asyncio.to_thread(
+                self.session.get_wallet_balance, accountType="spot", coin=coin
+            )
             avail = float(bal["result"]["list"][0]["availableBalance"])
             needed = qty * price if side.lower() == "buy" else qty
             if avail < needed:
@@ -506,7 +509,8 @@ class TradingBot:
 
         for _ in range(self.max_retries):
             try:
-                order = self.session.place_order(
+                order = await asyncio.to_thread(
+                    self.session.place_order,
                     category="spot",
                     symbol=self.symbol,
                     side="Buy" if side.lower() == "buy" else "Sell",
@@ -519,8 +523,11 @@ class TradingBot:
                 filled = qty
                 if order_id:
                     try:
-                        status = self.session.get_order(
-                            category="spot", symbol=self.symbol, orderId=order_id
+                        status = await asyncio.to_thread(
+                            self.session.get_order,
+                            category="spot",
+                            symbol=self.symbol,
+                            orderId=order_id,
                         )
                         ord_info = status.get("result", {}).get("list", [{}])[0]
                         filled = float(ord_info.get("cumExecQty", filled))
@@ -530,11 +537,11 @@ class TradingBot:
                 return {"response": order, "filledQty": filled}
             except Exception as exc:
                 logger.warning("Order error: %s", exc)
-                time.sleep(1)
+                await asyncio.sleep(1)
         raise RuntimeError("Failed to place order")
 
     # ------------------------------------------------------------------
-    def open_long(self, price: float) -> None:
+    async def open_long(self, price: float) -> None:
         if not self.risk_manager.can_trade():
             logger.info("Risk limits prevent opening long position")
             return
@@ -544,7 +551,7 @@ class TradingBot:
             return
         tp_price = price * (1 + self.tp_percent / 100)
         sl_price = price * (1 - self.sl_percent / 100)
-        order = self.place_order("buy", qty, tp=tp_price, sl=sl_price)
+        order = await self.place_order("buy", qty, tp=tp_price, sl=sl_price)
         filled = order.get("filledQty", qty) if order else qty
         self.position_price = price
         self.position_amount = filled
@@ -552,9 +559,9 @@ class TradingBot:
             price * (1 - self.trailing_percent / 100) if self.trailing_percent else None
         )
         self.log_trade("buy", price, filled, tp=tp_price, sl=sl_price)
-        self.send_telegram(f"Opened long {filled:.6f} {self.symbol} @ {price}")
+        await self.send_telegram(f"Opened long {filled:.6f} {self.symbol} @ {price}")
 
-    def open_short(self, price: float) -> None:
+    async def open_short(self, price: float) -> None:
         if not self.risk_manager.can_trade():
             logger.info("Risk limits prevent opening short position")
             return
@@ -564,7 +571,7 @@ class TradingBot:
             return
         tp_price = price * (1 - self.tp_percent / 100)
         sl_price = price * (1 + self.sl_percent / 100)
-        order = self.place_order("sell", qty, tp=tp_price, sl=sl_price)
+        order = await self.place_order("sell", qty, tp=tp_price, sl=sl_price)
         filled = order.get("filledQty", qty) if order else qty
         self.position_price = price
         self.position_amount = -filled
@@ -572,23 +579,49 @@ class TradingBot:
             price * (1 + self.trailing_percent / 100) if self.trailing_percent else None
         )
         self.log_trade("sell", price, filled, tp=tp_price, sl=sl_price)
-        self.send_telegram(f"Opened short {filled:.6f} {self.symbol} @ {price}")
+        await self.send_telegram(f"Opened short {filled:.6f} {self.symbol} @ {price}")
 
-    def close_position(self, price: float) -> None:
+    async def close_position(self, price: float) -> None:
         if self.position_amount == 0:
             return
         side = "sell" if self.position_amount > 0 else "buy"
         qty = abs(self.position_amount)
-        self.place_order(side, qty)
+        try:
+            order = await self.place_order(side, qty)
+        except Exception as exc:
+            logger.warning("Close position error: %s", exc)
+            return
+        if not order:
+            logger.warning("Close order returned no data")
+            return
+        filled = order.get("filledQty", 0)
+        if filled < qty:
+            logger.warning("Partial close: %s/%s", filled, qty)
+            pnl = (price - self.position_price) * (
+                filled if self.position_amount > 0 else -filled
+            )
+            self.update_pnl(pnl)
+            self.log_trade("close_partial", price, filled, pnl)
+            await self.send_telegram(
+                f"Partially closed {filled:.6f} {self.symbol} pnl={pnl:.2f}"
+            )
+            if self.position_amount > 0:
+                self.position_amount -= filled
+            else:
+                self.position_amount += filled
+            if self.position_amount == 0:
+                self.position_price = None
+                self.trailing_price = None
+            return
         pnl = (price - self.position_price) * self.position_amount
         self.update_pnl(pnl)
         self.log_trade("close", price, qty, pnl)
-        self.send_telegram(f"Closed position {side} pnl={pnl:.2f}")
+        await self.send_telegram(f"Closed position {side} pnl={pnl:.2f}")
         self.position_amount = 0
         self.position_price = None
         self.trailing_price = None
 
-    def handle_trailing(self, price: float) -> bool:
+    async def handle_trailing(self, price: float) -> bool:
         """Update trailing stop and close position if hit.
 
         Returns ``True`` if the trailing stop triggered and the position was
@@ -605,7 +638,7 @@ class TradingBot:
             ):
                 self.trailing_price = price * (1 - self.trailing_percent / 100)
             if price <= self.trailing_price:
-                self.close_position(price)
+                await self.close_position(price)
                 return True
         else:  # short position
             if (
@@ -614,7 +647,7 @@ class TradingBot:
             ):
                 self.trailing_price = price * (1 + self.trailing_percent / 100)
             if price >= self.trailing_price:
-                self.close_position(price)
+                await self.close_position(price)
                 return True
 
         return False
@@ -755,31 +788,34 @@ class TradingBot:
                     await asyncio.sleep(self.interval)
                     continue
                 prob = self.model.predict_proba(features)[0][1]
-                action = self.strategy.decide(features, price)
+                if hasattr(self.strategy, "decide_with_prob"):
+                    action = self.strategy.decide_with_prob(features, price, prob)
+                else:
+                    action = self.strategy.decide(features, price)
 
                 if self.position_amount > 0:  # long
                     if price >= self.position_price * (
                         1 + self.tp_percent / 100
                     ) or price <= self.position_price * (1 - self.sl_percent / 100):
-                        self.close_position(price)
+                        await self.close_position(price)
                     else:
-                        self.handle_trailing(price)
+                        await self.handle_trailing(price)
                 elif self.position_amount < 0:  # short
                     if price <= self.position_price * (
                         1 - self.tp_percent / 100
                     ) or price >= self.position_price * (1 + self.sl_percent / 100):
-                        self.close_position(price)
+                        await self.close_position(price)
                     else:
-                        self.handle_trailing(price)
+                        await self.handle_trailing(price)
                 if self.position_amount == 0:
                     if action == "long" or (
                         action is None and prob > self.long_threshold
                     ):
-                        self.open_long(price)
+                        await self.open_long(price)
                     elif action == "short" or (
                         action is None and prob < self.short_threshold
                     ):
-                        self.open_short(price)
+                        await self.open_short(price)
                 await asyncio.sleep(self.interval)
                 iteration += 1
                 if max_iterations is not None and iteration >= max_iterations:

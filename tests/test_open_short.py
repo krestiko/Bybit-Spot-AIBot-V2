@@ -1,3 +1,5 @@
+import asyncio
+
 from bybitbot import TradingBot
 
 
@@ -5,12 +7,17 @@ def test_open_short(tmp_path):
     bot = TradingBot()
     bot.trade_file = tmp_path / "trades.csv"
     messages = []
-    bot.place_order = lambda side, qty, tp=None, sl=None: {"filledQty": qty}
-    bot.send_telegram = lambda msg: messages.append(msg)
+    async def fake_place_order(side, qty, tp=None, sl=None):
+        return {"filledQty": qty}
+    bot.place_order = fake_place_order
+
+    async def fake_send(msg):
+        messages.append(msg)
+    bot.send_telegram = fake_send
     bot.trailing_percent = 1.0
     bot.qty_step = 0.01
     expected_qty = bot._round_qty(bot.compute_trade_amount() / 100.0)
-    bot.open_short(100.0)
+    asyncio.run(bot.open_short(100.0))
     assert bot.position_price == 100.0
     assert bot.position_amount == -expected_qty
     assert bot.trailing_price == 101.0
