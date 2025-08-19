@@ -5,6 +5,11 @@ from typing import List, Optional
 
 import joblib
 import numpy as np
+
+# Compatibility for pandas_ta with NumPy >=2 where `NaN` alias was removed
+if not hasattr(np, "NaN"):
+    np.NaN = np.nan  # type: ignore[attr-defined]
+
 import pandas as pd
 import pandas_ta as ta
 import requests
@@ -54,7 +59,9 @@ class TradingBot:
         self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
         self.model_file = os.getenv("MODEL_FILE", "model.pkl")
 
-        self.history_df = pd.DataFrame(columns=["close", "volume", "bid_qty", "ask_qty"])
+        self.history_df = pd.DataFrame(
+            columns=["close", "high", "low", "volume", "bid_qty", "ask_qty"]
+        )
         self._write_counter = 0
         self.features_list: List[np.ndarray] = []
         self.labels_list: List[int] = []
@@ -71,6 +78,8 @@ class TradingBot:
 
         self.session = HTTP(api_key=self.api_key, api_secret=self.api_secret)
         self.last_price: Optional[float] = None
+        self.last_high: Optional[float] = None
+        self.last_low: Optional[float] = None
         self.last_volume: Optional[float] = None
         self.last_bid_qty: float = 0.0
         self.last_ask_qty: float = 0.0
@@ -102,8 +111,52 @@ class TradingBot:
 
     # ------------------------------------------------------------------
     def send_telegram(self, msg: str) -> None:
-@@ -160,155 +169,172 @@ class TradingBot:
-            stoch = ta.stoch(df["close"])
+        """Send a message via Telegram if credentials are set."""
+        if not (self.telegram_token and self.telegram_chat_id):
+            return
+        url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
+        try:
+            requests.post(
+                url,
+                json={"chat_id": self.telegram_chat_id, "text": msg},
+                timeout=5,
+            )
+        except Exception as exc:
+            logging.warning("Telegram send error: %s", exc)
+
+    def fetch_news_sentiment(self) -> float:
+        """Placeholder for news sentiment. Returns neutral sentiment."""
+        return 0.0
+
+    def compute_features(self, df: pd.DataFrame) -> Optional[np.ndarray]:
+        """Compute technical indicators from a price history frame."""
+        df = df.copy()
+        required: List[str] = []
+        if "rsi" in self.indicators:
+            df["rsi"] = ta.rsi(df["close"], length=14)
+            required.append("rsi")
+        if "macd" in self.indicators:
+            macd = ta.macd(df["close"])
+            df["macd"] = macd["MACD_12_26_9"]
+            df["macd_signal"] = macd["MACDs_12_26_9"]
+            required.extend(["macd", "macd_signal"])
+        if "bb" in self.indicators:
+            bb = ta.bbands(df["close"])
+            df["bb_low"] = bb["BBL_5_2.0"]
+            df["bb_high"] = bb["BBU_5_2.0"]
+            required.extend(["bb_low", "bb_high"])
+        if "sma" in self.indicators:
+            df["sma"] = ta.sma(df["close"], length=10)
+            required.append("sma")
+        if "ema" in self.indicators:
+            df["ema"] = ta.ema(df["close"], length=10)
+            required.append("ema")
+        if "adx" in self.indicators:
+            adx = ta.adx(df["high"], df["low"], df["close"])
+            df["adx"] = adx["ADX_14"]
+            required.append("adx")
+        if "stoch" in self.indicators:
+            stoch = ta.stoch(df["high"], df["low"], df["close"])
             df["stoch_k"] = stoch["STOCHk_14_3_3"]
             df["stoch_d"] = stoch["STOCHd_14_3_3"]
             required.extend(["stoch_k", "stoch_d"])
@@ -111,7 +164,9 @@ class TradingBot:
             df["obv"] = ta.obv(df["close"], df["volume"])
             required.append("obv")
         denom = df["bid_qty"] + df["ask_qty"]
-        df["bid_ask_ratio"] = np.where(denom == 0, 0, (df["bid_qty"] - df["ask_qty"]) / denom)
+        df["bid_ask_ratio"] = np.where(
+            denom == 0, 0, (df["bid_qty"] - df["ask_qty"]) / denom
+        )
         required.append("bid_ask_ratio")
         if "news" in self.indicators:
             df["sentiment"] = self.fetch_news_sentiment()
@@ -123,9 +178,11 @@ class TradingBot:
         return np.array(feats, dtype=float).reshape(1, -1)
 
     # ------------------------------------------------------------------
-    def append_market_data(self, price: float, volume: float, bid: float, ask: float) -> None:
+    def append_market_data(
+        self, price: float, high: float, low: float, volume: float, bid: float, ask: float
+    ) -> None:
         """Append market data to internal history."""
-        self.history_df.loc[len(self.history_df)] = [price, volume, bid, ask]
+        self.history_df.loc[len(self.history_df)] = [price, high, low, volume, bid, ask]
         if len(self.history_df) > self.history_len + 50:
             self.history_df = self.history_df.iloc[-(self.history_len + 50) :]
         self._write_counter += 1
@@ -143,9 +200,17 @@ class TradingBot:
         return self.trade_amount * factor
 
     # ------------------------------------------------------------------
-    def update_model(self, price: float, volume: float, bid: float, ask: float) -> Optional[np.ndarray]:
+    def update_model(
+        self,
+        price: float,
+        high: float,
+        low: float,
+        volume: float,
+        bid: float,
+        ask: float,
+    ) -> Optional[np.ndarray]:
         """Update ML model with new market observation."""
-        self.append_market_data(price, volume, bid, ask)
+        self.append_market_data(price, high, low, volume, bid, ask)
         if len(self.history_df) < self.history_len + 1:
             return None
         df = self.history_df.iloc[-(self.history_len + 1) :]
@@ -188,25 +253,34 @@ class TradingBot:
         return self.scaler.transform(latest) if latest is not None else None
 
     # ------------------------------------------------------------------
-    def get_market_data(self) -> tuple[float, float, float, float]:
+    def get_market_data(self) -> tuple[float, float, float, float, float, float]:
         """Fetch latest market data."""
         for _ in range(self.max_retries):
             try:
                 tick = self.session.get_tickers(category="spot", symbol=self.symbol)
                 ticker = tick["result"]["list"][0]
                 price = float(ticker["lastPrice"])
+                high = price
+                low = price
                 try:
                     kl = self.session.get_kline(
                         category="spot", symbol=self.symbol, interval="1", limit=1
                     )
                     kitem = kl["result"]["list"][0]
+                    price = float(kitem[4])
+                    high = float(kitem[2])
+                    low = float(kitem[3])
                     volume = float(kitem[5])
                 except Exception:
-                    volume = float(ticker.get("volume24h", ticker.get("turnover24h", 0)))
-                ob = self.session.get_orderbook(category="spot", symbol=self.symbol, limit=1)
+                    volume = float(
+                        ticker.get("volume24h", ticker.get("turnover24h", 0))
+                    )
+                ob = self.session.get_orderbook(
+                    category="spot", symbol=self.symbol, limit=1
+                )
                 bid_qty = float(ob["result"]["b"][0][1])
                 ask_qty = float(ob["result"]["a"][0][1])
-                return price, volume, bid_qty, ask_qty
+                return price, high, low, volume, bid_qty, ask_qty
             except Exception as exc:
                 logging.warning("Market data error: %s", exc)
                 time.sleep(1)
@@ -232,24 +306,7 @@ class TradingBot:
 
         for _ in range(self.max_retries):
             try:
-                order = self.session.place_order(
-                    category="spot",
-                    symbol=self.symbol,
-                    side="Buy" if side.lower() == "buy" else "Sell",
-                    orderType="Market",
-                    qty=qty,
-                    takeProfit=tp,
-                    stopLoss=sl,
-                )
-                order_id = order.get("result", {}).get("orderId")
-                if order_id:
-                    try:
-                        status = self.session.get_order(category="spot", symbol=self.symbol, orderId=order_id)
-                        ord_info = status.get("result", {}).get("list", [{}])[0]
-                        logging.info("Order status: %s", ord_info.get("orderStatus"))
-                    except Exception as exc:
-                        logging.warning("Order status error: %s", exc)
-                return order
+@@ -253,127 +327,178 @@ class TradingBot:
             except Exception as exc:
                 logging.warning("Order error: %s", exc)
                 time.sleep(1)
@@ -275,7 +332,42 @@ class TradingBot:
     def open_short(self, price: float) -> None:
         qty = self.compute_trade_amount() / price
         self.place_order(
-@@ -371,81 +397,106 @@ class TradingBot:
+            "sell",
+            qty,
+            tp=price * (1 - self.tp_percent / 100),
+            sl=price * (1 + self.sl_percent / 100),
+        )
+        self.position_price = price
+        self.position_amount = -qty
+        self.trailing_price = (
+            price * (1 + self.trailing_percent / 100) if self.trailing_percent else None
+        )
+        self.log_trade("sell", price, qty, tp=self.tp_percent, sl=self.sl_percent)
+        self.send_telegram(f"Opened short {qty:.6f} {self.symbol} @ {price}")
+
+    def close_position(self, price: float) -> None:
+        if self.position_amount == 0:
+            return
+        side = "sell" if self.position_amount > 0 else "buy"
+        qty = abs(self.position_amount)
+        self.place_order(side, qty)
+        pnl = (price - (self.position_price or price)) * self.position_amount
+        self.update_pnl(pnl)
+        self.log_trade(side, price, qty, pnl)
+        self.position_price = None
+        self.position_amount = 0.0
+        self.trailing_price = None
+        self.send_telegram(
+            f"Closed position {side} {qty:.6f} @ {price} (PnL {pnl:.2f})"
+        )
+
+    def log_trade(
+        self,
+        side: str,
+        price: float,
+        qty: float,
+        pnl: float = 0.0,
+        tp: Optional[float] = None,
         sl: Optional[float] = None,
     ) -> None:
         header = not os.path.exists(self.trade_file)
@@ -316,6 +408,15 @@ class TradingBot:
                 vol = data.get("volume") or data.get("v")
                 if vol:
                     self.last_volume = float(vol)
+                hi = data.get("high") or data.get("h")
+                lo = data.get("low") or data.get("l")
+                close = data.get("close") or data.get("c")
+                if hi is not None:
+                    self.last_high = float(hi)
+                if lo is not None:
+                    self.last_low = float(lo)
+                if close is not None:
+                    self.last_price = float(close)
 
             def _order_cb(msg):
                 data = msg.get("data")
@@ -344,14 +445,21 @@ class TradingBot:
             if self.daily_profit_limit and self.daily_pnl >= self.daily_profit_limit:
                 logging.info("Daily profit target reached")
                 break
-            if use_websocket and self.last_price is not None and self.last_volume is not None:
-                price = self.last_price
-                vol = self.last_volume
+            if use_websocket and None not in (
+                self.last_price,
+                self.last_high,
+                self.last_low,
+                self.last_volume,
+            ):
+                price = self.last_price  # type: ignore[assignment]
+                high = self.last_high  # type: ignore[assignment]
+                low = self.last_low  # type: ignore[assignment]
+                vol = self.last_volume  # type: ignore[assignment]
                 bid = self.last_bid_qty
                 ask = self.last_ask_qty
             else:
-                price, vol, bid, ask = self.get_market_data()
-            features = self.update_model(price, vol, bid, ask)
+                price, high, low, vol, bid, ask = self.get_market_data()
+            features = self.update_model(price, high, low, vol, bid, ask)
             if features is None:
                 time.sleep(self.interval)
                 continue
@@ -377,8 +485,3 @@ class TradingBot:
                 elif prob < self.short_threshold:
                     self.open_short(price)
             time.sleep(self.interval)
-
-
-if __name__ == "__main__":
-    bot = TradingBot()
-    bot.trade_cycle()
