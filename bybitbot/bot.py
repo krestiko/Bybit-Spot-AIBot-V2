@@ -66,6 +66,7 @@ class TradingBot:
             columns=["close", "high", "low", "volume", "bid_qty", "ask_qty"]
         )
         self._write_counter = 0
+        self._trade_buffer: List[str] = []
         self.features_list: List[np.ndarray] = []
         self.labels_list: List[int] = []
         self.scaler = StandardScaler()
@@ -479,14 +480,28 @@ class TradingBot:
         tp: Optional[float] = None,
         sl: Optional[float] = None,
     ) -> None:
-        """Append trade information to the trade history file."""
-        header = not os.path.exists(self.trade_file)
-        with open(self.trade_file, "a") as f:
-            if header:
-                f.write("time,side,price,qty,pnl,tp,sl\n")
-            f.write(
-                f"{time.strftime('%Y-%m-%d %H:%M:%S')},{side},{price},{qty},{pnl},{tp},{sl}\n"
-            )
+        """Append trade information to the trade history file.
+
+        If the file cannot be written (e.g. due to ``OSError``), the trade
+        is buffered and a warning is logged. Buffered trades are retried on
+        subsequent calls.
+        """
+
+        line = (
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')},{side},{price},{qty},{pnl},{tp},{sl}\n"
+        )
+        records = self._trade_buffer + [line]
+        try:
+            header = not os.path.exists(self.trade_file)
+            with open(self.trade_file, "a") as f:
+                if header:
+                    f.write("time,side,price,qty,pnl,tp,sl\n")
+                for rec in records:
+                    f.write(rec)
+            self._trade_buffer.clear()
+        except OSError as exc:
+            logging.warning("Unable to write trade log: %s", exc)
+            self._trade_buffer = records
 
     def reset_daily_pnl(self) -> None:
         today = time.strftime("%Y-%m-%d")
