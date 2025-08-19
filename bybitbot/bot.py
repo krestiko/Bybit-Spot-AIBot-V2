@@ -88,6 +88,8 @@ class TradingBot:
         self.last_volume: Optional[float] = None
         self.last_bid_qty: float = 0.0
         self.last_ask_qty: float = 0.0
+        self.last_price_time: float = 0.0
+        self.price_cache_interval = int(os.getenv("PRICE_CACHE_SECONDS", 60))
 
         self._news_cache: float = 0.0
         self._news_time: float = 0.0
@@ -234,7 +236,9 @@ class TradingBot:
             required.append("obv")
         denom = df["bid_qty"] + df["ask_qty"]
         df["bid_ask_ratio"] = np.where(denom == 0, 0, (df["bid_qty"] - df["ask_qty"]) / denom)
-        required.append("bid_ask_ratio")
+        tech_inds = [i for i in self.indicators if i != "news"]
+        if len(tech_inds) <= 1:
+            required.append("bid_ask_ratio")
         if "news" in self.indicators:
             df["sentiment"] = self.fetch_news_sentiment()
             required.append("sentiment")
@@ -348,6 +352,19 @@ class TradingBot:
         if simulate:
             logging.info("Simulated order: %s %s", side, qty)
             return {"price": self.last_price, "qty": qty, "filledQty": qty}
+        if self.last_price is None or time.time() - self.last_price_time > self.price_cache_interval:
+            try:
+                price, high, low, volume, bid, ask = self.get_market_data()
+                self.last_price = price
+                self.last_high = high
+                self.last_low = low
+                self.last_volume = volume
+                self.last_bid_qty = bid
+                self.last_ask_qty = ask
+                self.last_price_time = time.time()
+            except Exception as exc:
+                logging.error("Market data error: %s", exc)
+                raise RuntimeError("Failed to fetch price for order") from exc
 
         price = self.last_price or 0
         try:
