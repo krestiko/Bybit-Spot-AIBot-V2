@@ -21,3 +21,5 @@ def test_open_short(tmp_path):
     assert row[1] == "sell"
     assert float(row[2]) == 100.0
     assert float(row[3]) == expected_qty
+    assert float(row[5]) == 100.0 * (1 - bot.tp_percent / 100)
+    assert float(row[6]) == 100.0 * (1 + bot.sl_percent / 100)
