@@ -5,18 +5,17 @@ from typing import List, Optional
 
 import joblib
 import numpy as np
-import math
-
-# Compatibility for pandas_ta with NumPy >=2 where `NaN` alias was removed
-if not hasattr(np, "NaN"):
-    np.NaN = np.nan  # type: ignore[attr-defined]
-
+try:  # pragma: no cover - needed for pandas_ta on NumPy>=2
+    from numpy import NaN  # type: ignore  # noqa: F401
+except Exception:  # pragma: no cover
+    np.NaN = np.nan
 import pandas as pd
 import pandas_ta as ta
+import math
 import requests
 import yaml
 from dotenv import load_dotenv
-from pybit.unified_trading import HTTP, WebSocket
+from pybit.unified_trading import HTTP
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.linear_model import SGDClassifier
 from sklearn.preprocessing import StandardScaler
@@ -57,7 +56,7 @@ class TradingBot:
             ["rsi", "macd", "bb", "sma", "ema", "adx", "stoch", "obv"],
         )
         self.telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
-         self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
+        self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
         self.model_file = os.getenv("MODEL_FILE", "model.pkl")
 
         self.history_df = pd.DataFrame(
@@ -77,13 +76,9 @@ class TradingBot:
         self.daily_pnl: float = 0.0
         self.daily_date: str = time.strftime("%Y-%m-%d")
 
-        self.news_sentiment: Optional[float] = None
-        self.news_timestamp: float = 0.0
-        self.news_refresh_interval = int(os.getenv("NEWS_INTERVAL", 30)) * 60
-
         self.session = HTTP(api_key=self.api_key, api_secret=self.api_secret)
-        self.ws: Optional[WebSocket] = None
-        self._ws_active: bool = False
+        self.base_asset, self.quote_asset = self._split_symbol(self.symbol)
+        self.qty_step = self._get_qty_step()
         self.last_price: Optional[float] = None
         self.last_high: Optional[float] = None
         self.last_low: Optional[float] = None
@@ -91,13 +86,9 @@ class TradingBot:
         self.last_bid_qty: float = 0.0
         self.last_ask_qty: float = 0.0
 
-        try:
-            info = self.session.get_instruments_info(
-                category="spot", symbol=self.symbol
-            )
-            self.lot_size = float(info["result"]["list"][0].get("lotSize", 1e-8))
-        except Exception:
-            self.lot_size = 1e-8
+        self._news_cache: float = 0.0
+        self._news_time: float = 0.0
+        self.news_cache_interval = int(os.getenv("NEWS_CACHE_MINUTES", 30)) * 60
 
         self.long_threshold = float(os.getenv("LONG_THRESHOLD", 0.55))
         self.short_threshold = float(os.getenv("SHORT_THRESHOLD", 0.45))
@@ -109,6 +100,40 @@ class TradingBot:
                 return yaml.safe_load(f) or {}
         return {}
 
+    def _split_symbol(self, symbol: str) -> tuple[str, str]:
+        quotes = ["USDT", "USDC", "BTC", "ETH", "EUR", "USD"]
+        for q in quotes:
+            if symbol.endswith(q):
+                return symbol[: -len(q)], q
+        try:
+            info = self.session.get_instruments_info(category="spot", symbol=symbol)
+            item = info.get("result", {}).get("list", [{}])[0]
+            return item.get("baseCoin", symbol[:-4]), item.get("quoteCoin", symbol[-4:])
+        except Exception:
+            return symbol[:-4], symbol[-4:]
+
+    def _get_qty_step(self) -> float:
+        env_step = os.getenv("QTY_STEP")
+        if env_step:
+            try:
+                step = float(env_step)
+                return step if step > 0 else 1.0
+            except ValueError:
+                pass
+        try:
+            info = self.session.get_instruments_info(category="spot", symbol=self.symbol)
+            item = info.get("result", {}).get("list", [{}])[0]
+            lot = item.get("lotSizeFilter", {})
+            step = float(lot.get("qtyStep", 1))
+            return step if step > 0 else 1.0
+        except Exception:
+            return 1.0
+
+    def _round_qty(self, qty: float) -> float:
+        step = self.qty_step
+        return math.floor(qty / step) * step
+
+    def _init_model(self) -> None:
         if os.path.exists(self.model_file):
             saved = joblib.load(self.model_file)
             self.model = saved.get("model")
@@ -123,28 +148,50 @@ class TradingBot:
                 self.model = SGDClassifier(loss="log_loss")
             self.model_initialized = False
 
+    # ------------------------------------------------------------------
     def send_telegram(self, msg: str) -> None:
-        """Send a message via Telegram if credentials are provided."""
-        if not (self.telegram_token and self.telegram_chat_id):
+        """Send message to telegram if credentials configured."""
+        if not self.telegram_token or not self.telegram_chat_id:
             return
         try:
             requests.post(
                 f"https://api.telegram.org/bot{self.telegram_token}/sendMessage",
-                json={"chat_id": self.telegram_chat_id, "text": msg},
-                timeout=5,
+                data={"chat_id": self.telegram_chat_id, "text": msg},
             )
-        except Exception as exc:
-            logging.warning("Telegram send error: %s", exc)
+        except Exception as exc:  # pragma: no cover - network issues
+            logging.warning("Telegram error: %s", exc)
 
     def fetch_news_sentiment(self) -> float:
-        """Fetch news sentiment and cache the result and timestamp."""
-        sentiment = 0.0  # placeholder implementation
-        self.news_sentiment = sentiment
-        self.news_timestamp = time.time()
-        return sentiment
+        token = os.getenv("CRYPTO_NEWS_TOKEN")
+        if not token:
+            return 0.0
+        now = time.time()
+        if now - self._news_time < self.news_cache_interval:
+            return self._news_cache
+        try:
+            resp = requests.get(
+                "https://cryptopanic.com/api/v1/posts/",
+                params={"auth_token": token, "kind": "news", "public": "true"},
+                timeout=10,
+            )
+            data = resp.json()
+            posts = data.get("results", [])[:10]
+            score = 0.0
+            for post in posts:
+                if post.get("positive_votes", 0) >= post.get("negative_votes", 0):
+                    score += 1
+                else:
+                    score -= 1
+            self._news_cache = score / max(len(posts), 1)
+            self._news_time = now
+            return self._news_cache
+        except Exception as exc:  # pragma: no cover - network issues
+            logging.warning("News fetch error: %s", exc)
+            return 0.0
 
+    # ------------------------------------------------------------------
     def compute_features(self, df: pd.DataFrame) -> Optional[np.ndarray]:
-        """Compute technical indicators from a price history frame."""
+        """Compute indicator features for the given dataframe."""
         df = df.copy()
         required: List[str] = []
         if "rsi" in self.indicators:
@@ -153,13 +200,12 @@ class TradingBot:
         if "macd" in self.indicators:
             macd = ta.macd(df["close"])
             df["macd"] = macd["MACD_12_26_9"]
-            df["macd_signal"] = macd["MACDs_12_26_9"]
-            required.extend(["macd", "macd_signal"])
+            required.append("macd")
         if "bb" in self.indicators:
-            bb = ta.bbands(df["close"])
-            df["bb_low"] = bb["BBL_5_2.0"]
-            df["bb_high"] = bb["BBU_5_2.0"]
-            required.extend(["bb_low", "bb_high"])
+            bb = ta.bbands(df["close"], length=5)
+            df["bb_upper"] = bb["BBU_5_2.0"]
+            df["bb_lower"] = bb["BBL_5_2.0"]
+            required.extend(["bb_upper", "bb_lower"])
         if "sma" in self.indicators:
             df["sma"] = ta.sma(df["close"], length=10)
             required.append("sma")
@@ -167,7 +213,7 @@ class TradingBot:
             df["ema"] = ta.ema(df["close"], length=10)
             required.append("ema")
         if "adx" in self.indicators:
-            adx = ta.adx(df["high"], df["low"], df["close"])
+            adx = ta.adx(df["high"], df["low"], df["close"], length=14)
             df["adx"] = adx["ADX_14"]
             required.append("adx")
         if "stoch" in self.indicators:
@@ -179,22 +225,11 @@ class TradingBot:
             df["obv"] = ta.obv(df["close"], df["volume"])
             required.append("obv")
         denom = df["bid_qty"] + df["ask_qty"]
-        df["bid_ask_ratio"] = np.where(
-            denom == 0, 0, (df["bid_qty"] - df["ask_qty"]) / denom
-        )
+        df["bid_ask_ratio"] = np.where(denom == 0, 0, (df["bid_qty"] - df["ask_qty"]) / denom)
         required.append("bid_ask_ratio")
         if "news" in self.indicators:
-            now = time.time()
-            if (
-                self.news_sentiment is None
-                or now - self.news_timestamp > self.news_refresh_interval
-            ):
-                sentiment = self.fetch_news_sentiment()
-            else:
-                sentiment = self.news_sentiment
-            df["sentiment"] = sentiment
+            df["sentiment"] = self.fetch_news_sentiment()
             required.append("sentiment")
-         required.append("sentiment")
         row = df.iloc[-1]
         if row[required].isna().any():
             return None
@@ -213,106 +248,316 @@ class TradingBot:
         if self._write_counter % self.save_interval == 0:
             self.history_df.to_csv(self.price_file, index=False)
 
-    def _round_qty(self, qty: float) -> float:
-        if self.lot_size <= 0:
-            return qty
-        return math.floor(qty / self.lot_size) * self.lot_size
+    def compute_trade_amount(self) -> float:
+        """Return position size based on recent volatility."""
+        if len(self.history_df) < 10:
+            return self.trade_amount
+        vol = self.history_df["close"].pct_change().rolling(10).std().iloc[-1]
+        if pd.isna(vol) or vol == 0:
+            return self.trade_amount
+        factor = min(1.0, 0.02 / vol)
+        return self.trade_amount * factor
 
-    def compute_trade_amount(self, price: float) -> float:
-        """Return quantity to trade based on configured USDT amount."""
-        if price <= 0:
-            return 0.0
-        qty = self.trade_amount / price
-        return self._round_qty(qty)
+    # ------------------------------------------------------------------
+    def update_model(
+        self, price: float, high: float, low: float, volume: float, bid: float, ask: float
+    ) -> Optional[np.ndarray]:
+        """Update ML model with new market observation."""
+        self.append_market_data(price, high, low, volume, bid, ask)
+        if len(self.history_df) < self.history_len + 1:
+            return None
+        df = self.history_df.iloc[-(self.history_len + 1) :]
+        features = self.compute_features(df.iloc[:-1])
+        if features is None:
+            return None
+        label = 1 if df["close"].iloc[-1] > df["close"].iloc[-2] else 0
+        self.features_list.append(features.flatten())
+        self.labels_list.append(label)
+        if len(self.features_list) > self.history_len:
+            self.features_list.pop(0)
+            self.labels_list.pop(0)
+        self.scaler.partial_fit(features)
+        X = np.array(self.features_list)
+        y = np.array(self.labels_list)
+        Xs = self.scaler.transform(X)
+        try:
+            if not self.model_initialized:
+                self.model.fit(Xs, y)
+            elif hasattr(self.model, "partial_fit"):
+                self.model.partial_fit(
+                    self.scaler.transform(features), [label], classes=np.array([0, 1])
+                )
+            elif self.train_counter % self.retrain_interval == 0:
+                self.model.fit(Xs, y)
+        except Exception as exc:
+            logging.warning("Model train error: %s", exc)
+        if len(Xs) and hasattr(self.model, "predict"):
+            try:
+                preds = self.model.predict(Xs)
+                acc = float((preds == y).mean())
+                logging.info("Training accuracy: %.3f", acc)
+            except Exception:
+                pass
+        self.train_counter += 1
+        if self.train_counter % self.model_save_interval == 0:
+            joblib.dump({"model": self.model, "scaler": self.scaler}, self.model_file)
+        self.model_initialized = True
+        latest = self.compute_features(df.iloc[-self.history_len :])
+        return self.scaler.transform(latest) if latest is not None else None
+
     # ------------------------------------------------------------------
     def get_market_data(self) -> tuple[float, float, float, float, float, float]:
-        """Fetch latest market data.
-
-        This placeholder implementation avoids network calls in tests.
-        """
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        """Fetch latest market data."""
+        for _ in range(self.max_retries):
+            try:
+                tick = self.session.get_tickers(category="spot", symbol=self.symbol)
+                ticker = tick["result"]["list"][0]
+                price = float(ticker["lastPrice"])
+                try:
+                    kl = self.session.get_kline(
+                        category="spot", symbol=self.symbol, interval="1", limit=1
+                    )
+                    kitem = kl["result"]["list"][0]
+                    high = float(kitem[2])
+                    low = float(kitem[3])
+                    volume = float(kitem[5])
+                except Exception:
+                    high = low = price
+                    volume = float(ticker.get("volume24h", ticker.get("turnover24h", 0)))
+                ob = self.session.get_orderbook(category="spot", symbol=self.symbol, limit=1)
+                bid_qty = float(ob["result"]["b"][0][1])
+                ask_qty = float(ob["result"]["a"][0][1])
+                return price, high, low, volume, bid_qty, ask_qty
+            except Exception as exc:
+                logging.warning("Market data error: %s", exc)
+                time.sleep(1)
+        raise RuntimeError("Failed to fetch market data")
 
     def place_order(
         self, side: str, qty: float, tp: Optional[float] = None, sl: Optional[float] = None
     ):
-        """Simplified order placement used for testing."""
-        logging.info("Simulated order: %s %s", side, qty)
-        return {"price": self.last_price, "qty": qty}
+        simulate = not (self.api_key and self.api_secret)
+        if simulate:
+            logging.info("Simulated order: %s %s", side, qty)
+            return {"price": self.last_price, "qty": qty, "filledQty": qty}
 
-    def open_long(self, price: float) -> None:
-        """Placeholder for opening a long position."""
-        pass
+        price = self.last_price or 0
+        try:
+            coin = self.quote_asset if side.lower() == "buy" else self.base_asset
+            bal = self.session.get_wallet_balance(accountType="spot", coin=coin)
+            avail = float(bal["result"]["list"][0]["availableBalance"])
+            needed = qty * price if side.lower() == "buy" else qty
+            if avail < needed:
+                logging.warning("Insufficient balance: have %s need %s", avail, needed)
+                return None
+        except Exception as exc:
+            logging.warning("Balance check error: %s", exc)
 
-    def close_position(self, price: float) -> None:
-        """Placeholder for closing an open position."""
-        pass
-
-    def log_trade(
-        self,
-        side: str,
-        price: float,
-        qty: float,
-        pnl: float = 0.0,
-        tp: Optional[float] = None,
-        sl: Optional[float] = None,
-    ) -> None:
-        """Placeholder for recording trade information."""
-        pass
+        for _ in range(self.max_retries):
+            try:
+                order = self.session.place_order(
+                    category="spot",
+                    symbol=self.symbol,
+                    side="Buy" if side.lower() == "buy" else "Sell",
+                    orderType="Market",
+                    qty=qty,
+                    takeProfit=tp,
+                    stopLoss=sl,
+                )
+                order_id = order.get("result", {}).get("orderId")
+                filled = qty
+                if order_id:
+                    try:
+                        status = self.session.get_order(
+                            category="spot", symbol=self.symbol, orderId=order_id
+                        )
+                        ord_info = status.get("result", {}).get("list", [{}])[0]
+                        filled = float(ord_info.get("cumExecQty", filled))
+                        logging.info("Order status: %s", ord_info.get("orderStatus"))
+                    except Exception as exc:
+                        logging.warning("Order status error: %s", exc)
+                return {"response": order, "filledQty": filled}
+            except Exception as exc:
+                logging.warning("Order error: %s", exc)
+                time.sleep(1)
+        raise RuntimeError("Failed to place order")
 
     # ------------------------------------------------------------------
-    # WebSocket handling
-    def _handle_ticker(self, msg: dict) -> None:
-        """Process incoming ticker messages to update last known values."""
-        try:
-            data = msg.get("data", [{}])[0]
-            self.last_price = float(data.get("lastPrice", self.last_price or 0))
-            self.last_high = float(data.get("highPrice24h", self.last_high or 0))
-            self.last_low = float(data.get("lowPrice24h", self.last_low or 0))
-            self.last_volume = float(data.get("volume24h", self.last_volume or 0))
-            self.last_bid_qty = float(data.get("bid1Size", self.last_bid_qty))
-            self.last_ask_qty = float(data.get("ask1Size", self.last_ask_qty))
-        except Exception as exc:
-            logging.debug("Ticker parse error: %s", exc)
+    def open_long(self, price: float) -> None:
+        qty = self._round_qty(self.compute_trade_amount() / price)
+        order = self.place_order(
+            "buy",
+            qty,
+            tp=price * (1 + self.tp_percent / 100),
+            sl=price * (1 - self.sl_percent / 100),
+        )
+        filled = order.get("filledQty", qty) if order else qty
+        self.position_price = price
+        self.position_amount = filled
+        self.trailing_price = (
+            price * (1 - self.trailing_percent / 100) if self.trailing_percent else None
+        )
+        self.log_trade("buy", price, filled, tp=self.tp_percent, sl=self.sl_percent)
+        self.send_telegram(f"Opened long {filled:.6f} {self.symbol} @ {price}")
 
-    def _subscribe_streams(self) -> None:
-        """Subscribe to required WebSocket streams."""
-        if self.ws is None:
+    def open_short(self, price: float) -> None:
+        qty = self._round_qty(self.compute_trade_amount() / price)
+        order = self.place_order(
+            "sell",
+            qty,
+            tp=price * (1 - self.tp_percent / 100),
+            sl=price * (1 + self.sl_percent / 100),
+        )
+        filled = order.get("filledQty", qty) if order else qty
+        self.position_price = price
+        self.position_amount = -filled
+        self.trailing_price = (
+            price * (1 + self.trailing_percent / 100) if self.trailing_percent else None
+        )
+        self.log_trade("sell", price, filled, tp=self.tp_percent, sl=self.sl_percent)
+        self.send_telegram(f"Opened short {filled:.6f} {self.symbol} @ {price}")
+
+    def close_position(self, price: float) -> None:
+        if self.position_amount == 0:
             return
-        try:
-            self.ws.ticker_stream(symbol=self.symbol, callback=self._handle_ticker)
-        except Exception as exc:
-            logging.warning("WebSocket subscribe error: %s", exc)
+        side = "sell" if self.position_amount > 0 else "buy"
+        qty = abs(self.position_amount)
+        self.place_order(side, qty)
+        pnl = (price - self.position_price) * self.position_amount
+        self.update_pnl(pnl)
+        self.log_trade("close", price, qty, pnl)
+        self.send_telegram(f"Closed position {side} pnl={pnl:.2f}")
+        self.position_amount = 0
+        self.position_price = None
+        self.trailing_price = None
 
-    def _on_ws_close(self, ws, *args, **kwargs) -> None:
-        """Callback for WebSocket close events."""
-        logging.warning("WebSocket closed")
-        self._ws_active = False
+    def handle_trailing(self, price: float) -> bool:
+        if self.trailing_price is None:
+            return False
+        if self.position_amount > 0:
+            if (
+                price > self.position_price
+                and price * (1 - self.trailing_percent / 100) > self.trailing_price
+            ):
+                self.trailing_price = price * (1 - self.trailing_percent / 100)
+            if price <= self.trailing_price:
+                  sl: Optional[float] = None,
+    ) -> None:
+        header = not os.path.exists(self.trade_file)
+        with open(self.trade_file, "a") as f:
+            if header:
+                f.write("time,side,price,qty,pnl,tp,sl\n")
+            f.write(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')},{side},{price},{qty},{pnl},{tp},{sl}\n"
+            )
 
-    def _on_ws_error(self, ws, error=None, *args, **kwargs) -> None:
-        """Callback for WebSocket errors."""
-        logging.warning("WebSocket error: %s", error)
-        self._ws_active = False
+    def reset_daily_pnl(self) -> None:
+        today = time.strftime("%Y-%m-%d")
+        if today != self.daily_date:
+            self.daily_date = today
+            self.daily_pnl = 0.0
 
-    def run_websocket(self) -> None:
-        """Run WebSocket connection with automatic reconnection."""
+    def update_pnl(self, profit: float) -> None:
+        self.daily_pnl += profit
+
+    # ------------------------------------------------------------------
+    def trade_cycle(self) -> None:
+        use_websocket = os.getenv("USE_WEBSOCKET", "0") == "1"
+        if use_websocket:
+            from pybit.unified_trading import WebSocket
+
+            def _ticker_cb(msg):
+                data = msg.get("data")
+                if isinstance(data, list):
+                    data = data[0]
+                lp = data.get("lastPrice") or data.get("lp")
+                if lp:
+                    self.last_price = float(lp)
+
+            def _kline_cb(msg):
+                data = msg.get("data")
+                if isinstance(data, list):
+                    data = data[0]
+                vol = data.get("volume") or data.get("v")
+                high = data.get("high") or data.get("h")
+                low = data.get("low") or data.get("l")
+                close = data.get("close") or data.get("c")
+                if vol:
+                    self.last_volume = float(vol)
+                if high:
+                    self.last_high = float(high)
+                if low:
+                    self.last_low = float(low)
+                if close:
+                    self.last_price = float(close)
+
+            def _order_cb(msg):
+                data = msg.get("data")
+                if isinstance(data, list):
+                    data = data[0]
+                bids = data.get("b") or data.get("bid")
+                asks = data.get("a") or data.get("ask")
+                try:
+                    if bids:
+                        self.last_bid_qty = float(bids[0][1])
+                    if asks:
+                        self.last_ask_qty = float(asks[0][1])
+                except Exception:
+                    pass
+
+            ws = WebSocket("spot")
+            ws.ticker_stream(self.symbol, _ticker_cb)
+            ws.kline_stream(self.symbol, "1", _kline_cb)
+            ws.orderbook_stream(self.symbol, 1, _order_cb)
+
         while True:
-            try:
-                self.ws = WebSocket(
-                    channel_type="spot",
-                    on_close=self._on_ws_close,
-                    on_error=self._on_ws_error,
-                )
-                self._subscribe_streams()
-                self._ws_active = True
-                while self._ws_active:
-                    time.sleep(1)
-            except Exception as exc:
-                logging.warning("WebSocket connection error: %s", exc)
-            finally:
-                if self.ws is not None:
-                    try:
-                        self.ws.exit()
-                    except Exception:
-                        pass
-                    self.ws = None
-            time.sleep(5)
+            self.reset_daily_pnl()
+            if self.daily_loss_limit and self.daily_pnl <= -self.daily_loss_limit:
+                logging.warning("Daily loss limit reached")
+                break
+            if self.daily_profit_limit and self.daily_pnl >= self.daily_profit_limit:
+                logging.info("Daily profit target reached")
+                break
+            if (
+                use_websocket
+                and None not in (self.last_price, self.last_high, self.last_low, self.last_volume)
+            ):
+                price = self.last_price
+                high = self.last_high
+                low = self.last_low
+                vol = self.last_volume
+                bid = self.last_bid_qty
+                ask = self.last_ask_qty
+            else:
+                price, high, low, vol, bid, ask = self.get_market_data()
+            features = self.update_model(price, high, low, vol, bid, ask)
+            if features is None:
+                time.sleep(self.interval)
+                continue
+            prob = self.model.predict_proba(features)[0][1]
+
+            if self.position_amount > 0:  # long
+                if (
+                    price >= self.position_price * (1 + self.tp_percent / 100)
+                    or price <= self.position_price * (1 - self.sl_percent / 100)
+                    or self.handle_trailing(price)
+                ):
+                    self.close_position(price)
+            elif self.position_amount < 0:  # short
+                if (
+                    price <= self.position_price * (1 - self.tp_percent / 100)
+                    or price >= self.position_price * (1 + self.sl_percent / 100)
+                    or self.handle_trailing(price)
+                ):
+                    self.close_position(price)
+            if self.position_amount == 0:
+                if prob > self.long_threshold:
+                    self.open_long(price)
+                elif prob < self.short_threshold:
+                    self.open_short(price)
+            time.sleep(self.interval)
+
+
+if __name__ == "__main__":
+    bot = TradingBot()
+    bot.trade_cycle()
