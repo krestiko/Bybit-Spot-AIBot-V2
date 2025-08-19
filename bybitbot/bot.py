@@ -5,6 +5,7 @@ from typing import List, Optional
 
 import joblib
 import numpy as np
+import math
 
 # Compatibility for pandas_ta with NumPy >=2 where `NaN` alias was removed
 if not hasattr(np, "NaN"):
@@ -30,7 +31,6 @@ class TradingBot:
     def __init__(self, config_file: str = "config.yaml") -> None:
         self.config = self._load_config(config_file)
         self.api_key = os.getenv("BYBIT_API_KEY")
-        self.api_secret = os.getenv("BYBIT_API_SECRET")
         self.symbol = os.getenv("SYMBOL", "BTCUSDT")
         self.trade_amount = float(os.getenv("TRADE_AMOUNT_USDT", 10))
         self.tp_percent = float(
@@ -60,6 +60,7 @@ class TradingBot:
         self.model_file = os.getenv("MODEL_FILE", "model.pkl")
 
         self.history_df = pd.DataFrame(
+self.history_df = pd.DataFrame(
             columns=["close", "high", "low", "volume", "bid_qty", "ask_qty"]
         )
         self._write_counter = 0
@@ -83,6 +84,14 @@ class TradingBot:
         self.last_volume: Optional[float] = None
         self.last_bid_qty: float = 0.0
         self.last_ask_qty: float = 0.0
+
+        try:
+            info = self.session.get_instruments_info(
+                category="spot", symbol=self.symbol
+            )
+            self.lot_size = float(info["result"]["list"][0].get("lotSize", 1e-8))
+        except Exception:
+            self.lot_size = 1e-8
 
         self.long_threshold = float(os.getenv("LONG_THRESHOLD", 0.55))
         self.short_threshold = float(os.getenv("SHORT_THRESHOLD", 0.45))
@@ -108,16 +117,6 @@ class TradingBot:
             else:
                 self.model = SGDClassifier(loss="log_loss")
             self.model_initialized = False
-
-    # ------------------------------------------------------------------
-    def send_telegram(self, msg: str) -> None:
-        """Send a message via Telegram if credentials are set."""
-        if not (self.telegram_token and self.telegram_chat_id):
-            return
-        url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
-        try:
-            requests.post(
-                url,
                 json={"chat_id": self.telegram_chat_id, "text": msg},
                 timeout=5,
             )
@@ -174,6 +173,16 @@ class TradingBot:
         row = df.iloc[-1]
         if row[required].isna().any():
             return None
+        df["bid_ask_ratio"] = np.where(
+            denom == 0, 0, (df["bid_qty"] - df["ask_qty"]) / denom
+        )
+        required.append("bid_ask_ratio")
+        if "news" in self.indicators:
+            df["sentiment"] = self.fetch_news_sentiment()
+            required.append("sentiment")
+        row = df.iloc[-1]
+        if row[required].isna().any():
+            return None
         feats = row[required + ["volume"]].values
         return np.array(feats, dtype=float).reshape(1, -1)
 
@@ -189,15 +198,21 @@ class TradingBot:
         if self._write_counter % self.save_interval == 0:
             self.history_df.to_csv(self.price_file, index=False)
 
-    def compute_trade_amount(self) -> float:
-        """Return position size based on recent volatility."""
-        if len(self.history_df) < 10:
-            return self.trade_amount
-        vol = self.history_df["close"].pct_change().rolling(10).std().iloc[-1]
-        if pd.isna(vol) or vol == 0:
-            return self.trade_amount
-        factor = min(1.0, 0.02 / vol)
-        return self.trade_amount * factor
+    def _round_qty(self, qty: float) -> float:
+        if self.lot_size <= 0:
+            return qty
+        return math.floor(qty / self.lot_size) * self.lot_size
+
+    def compute_trade_amount(self, price: float) -> float:
+        """Return trade quantity based on recent volatility, rounded to lot size."""
+        amount = self.trade_amount
+        if len(self.history_df) >= 10:
+            vol = self.history_df["close"].pct_change().rolling(10).std().iloc[-1]
+            if not (pd.isna(vol) or vol == 0):
+                factor = min(1.0, 0.02 / vol)
+                amount *= factor
+        qty = amount / price
+        return self._round_qty(qty)
 
     # ------------------------------------------------------------------
     def update_model(
@@ -223,22 +238,6 @@ class TradingBot:
         if len(self.features_list) > self.history_len:
             self.features_list.pop(0)
             self.labels_list.pop(0)
-        self.scaler.partial_fit(features)
-        X = np.array(self.features_list)
-        y = np.array(self.labels_list)
-        Xs = self.scaler.transform(X)
-        try:
-            if not self.model_initialized:
-                self.model.fit(Xs, y)
-            elif hasattr(self.model, "partial_fit"):
-                self.model.partial_fit(
-                    self.scaler.transform(features), [label], classes=np.array([0, 1])
-                )
-            elif self.train_counter % self.retrain_interval == 0:
-                self.model.fit(Xs, y)
-        except Exception as exc:
-            logging.warning("Model train error: %s", exc)
-        if len(Xs) and hasattr(self.model, "predict"):
             try:
                 preds = self.model.predict(Xs)
                 acc = float((preds == y).mean())
@@ -277,6 +276,22 @@ class TradingBot:
                     )
                 ob = self.session.get_orderbook(
                     category="spot", symbol=self.symbol, limit=1
+                    low = price
+                try:
+                    kl = self.session.get_kline(
+                        category="spot", symbol=self.symbol, interval="1", limit=1
+                    )
+                    kitem = kl["result"]["list"][0]
+                    price = float(kitem[4])
+                    high = float(kitem[2])
+                    low = float(kitem[3])
+                    volume = float(kitem[5])
+                except Exception:
+                    volume = float(
+                        ticker.get("volume24h", ticker.get("turnover24h", 0))
+                    )
+                ob = self.session.get_orderbook(
+                    category="spot", symbol=self.symbol, limit=1
                 )
                 bid_qty = float(ob["result"]["b"][0][1])
                 ask_qty = float(ob["result"]["a"][0][1])
@@ -286,41 +301,20 @@ class TradingBot:
                 time.sleep(1)
         raise RuntimeError("Failed to fetch market data")
 
-    def _get_base_quote(self) -> tuple[str, str]:
-        """Determine base and quote currencies for the current symbol.
-
-        Tries to fetch instrument information from the exchange and falls
-        back to splitting by common quote suffixes if that fails.
-        """
-        try:
-            info = self.session.get_instruments_info(
-                category="spot", symbol=self.symbol
-            )
-            items = info.get("result", {}).get("list", [])
-            if items:
-                inst = items[0]
-                base = inst.get("baseCoin")
-                quote = inst.get("quoteCoin")
-                if base and quote:
-                    return base, quote
-        except Exception as exc:
-            logging.warning("Instrument info error: %s", exc)
-
-        known_suffixes = ["USDT", "USDC", "BTC", "ETH", "EUR", "GBP"]
-        for suffix in known_suffixes:
-            if self.symbol.endswith(suffix):
-                return self.symbol[: -len(suffix)], suffix
-        raise RuntimeError(f"Unable to determine base/quote for {self.symbol}")
-
-    def place_order(self, side: str, qty: float, tp: Optional[float] = None, sl: Optional[float] = None):
+    def place_order(
+        self, side: str, qty: float, tp: Optional[float] = None, sl: Optional[float] = None
+    ):
         simulate = not (self.api_key and self.api_secret)
         if simulate:
             logging.info("Simulated order: %s %s", side, qty)
             return {"price": self.last_price, "qty": qty}
-        base, quote = self._get_base_quote()
+
+        base, quote = self.symbol[:-4], self.symbol[-4:]
         price = self.last_price or 0
         try:
-            bal = self.session.get_wallet_balance(accountType="spot", coin=quote if side.lower() == "buy" else base)
+            bal = self.session.get_wallet_balance(
+                accountType="spot", coin=quote if side.lower() == "buy" else base
+            )
             avail = float(bal["result"]["list"][0]["availableBalance"])
             needed = qty * price if side.lower() == "buy" else qty
             if avail < needed:
@@ -331,18 +325,26 @@ class TradingBot:
 
         for _ in range(self.max_retries):
             try:
-                params = {
-                    "category": "spot",
-                    "symbol": self.symbol,
-                    "side": side.upper(),
-                    "orderType": "Market",
-                    "qty": str(qty),
-                }
-                if tp is not None:
-                    params["takeProfit"] = str(tp)
-                if sl is not None:
-                    params["stopLoss"] = str(sl)
-                return self.session.place_order(**params)
+                order = self.session.place_order(
+                    category="spot",
+                    symbol=self.symbol,
+                    side=side.capitalize(),
+                    orderType="Market",
+                    qty=qty,
+                    timeInForce="IOC",
+                    takeProfit=tp,
+                    stopLoss=sl,
+                )
+                oid = order.get("result", {}).get("orderId")
+                if not oid:
+                    return None
+                info = self.session.get_order(
+                    category="spot", symbol=self.symbol, orderId=oid
+                )
+                data = info.get("result", {}).get("list", [{}])[0]
+                fill_qty = float(data.get("cumExecQty", 0))
+                fill_price = float(data.get("avgPrice", price))
+                return {"price": fill_price, "qty": fill_qty}
             except Exception as exc:
                 logging.warning("Order error: %s", exc)
                 time.sleep(1)
@@ -350,21 +352,70 @@ class TradingBot:
 
     # ------------------------------------------------------------------
     def open_long(self, price: float) -> None:
-        qty = self.compute_trade_amount() / price
-        self.place_order(
+        qty = self.compute_trade_amount(price)
+        qty = self._round_qty(qty)
+        res = self.place_order(
             "buy",
             qty,
             tp=price * (1 + self.tp_percent / 100),
             sl=price * (1 - self.sl_percent / 100),
         )
-        self.position_price = price
-        self.position_amount = qty
-        self.trailing_price = (
-            price * (1 - self.trailing_percent / 100) if self.trailing_percent else None
-        )
-        self.log_trade("buy", price, qty, tp=self.tp_percent, sl=self.sl_percent)
-        self.send_telegram(f"Opened long {qty:.6f} {self.symbol} @ {price}")
+        if res:
+            self.position_price = res.get("price", price)
+            self.position_amount = res.get("qty", 0)
+            self.trailing_price = (
+                price * (1 - self.trailing_percent / 100)
+                if self.trailing_percent
+                else None
+            )
+            self.log_trade("buy", price, self.position_amount, tp=self.tp_percent, sl=self.sl_percent)
+            self.send_telegram(
+                f"Opened long {self.position_amount:.6f} {self.symbol} @ {self.position_price}"
+            )
 
     def open_short(self, price: float) -> None:
-        qty = self.compute_trade_amount() / price
-        self.place_order(
+        qty = self.compute_trade_amount(price)
+        qty = self._round_qty(qty)
+        res = self.place_order(
+            "sell",
+            qty,
+            tp=price * (1 - self.tp_percent / 100),
+            sl=price * (1 + self.sl_percent / 100),
+        )
+        if res:
+            self.position_price = res.get("price", price)
+            self.position_amount = -res.get("qty", 0)
+            self.trailing_price = (
+                price * (1 + self.trailing_percent / 100)
+                if self.trailing_percent
+                else None
+            )
+            self.log_trade("sell", price, -self.position_amount, tp=self.tp_percent, sl=self.sl_percent)
+            self.send_telegram(
+                f"Opened short {-self.position_amount:.6f} {self.symbol} @ {self.position_price}"
+            )
+
+    def close_position(self, price: float) -> None:
+        if self.position_amount == 0:
+            return
+        side = "sell" if self.position_amount > 0 else "buy"
+        qty = abs(self.position_amount)
+        self.place_order(side, qty)
+        pnl = (price - (self.position_price or price)) * self.position_amount
+        self.update_pnl(pnl)
+        self.log_trade(side, price, qty, pnl)
+        self.position_price = None
+        self.position_amount = 0.0
+        self.trailing_price = None
+        self.send_telegram(
+            f"Closed position {side} {qty:.6f} @ {price} (PnL {pnl:.2f})"
+        )
+
+    def log_trade(
+        self,
+        side: str,
+        price: float,
+        qty: float,
+        pnl: float = 0.0,
+        tp: Optional[float] = None,
+        sl: Optional[float] = None,
