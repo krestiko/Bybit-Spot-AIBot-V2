@@ -29,6 +29,9 @@ class TradingBot:
 
     def __init__(self, config_file: str = "config.yaml") -> None:
         self.config = self._load_config(config_file)
+        log_level_str = os.getenv("LOG_LEVEL") or self.config.get("logging", {}).get("level", "INFO")
+        log_level = getattr(logging, log_level_str.upper(), logging.INFO)
+        logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s %(message)s")
         self.api_key = os.getenv("BYBIT_API_KEY")
         self.api_secret = os.getenv("BYBIT_API_SECRET")
         self.symbol = os.getenv("SYMBOL", "BTCUSDT")
@@ -408,8 +411,6 @@ class TradingBot:
             tp=price * (1 - self.tp_percent / 100),
             sl=price * (1 + self.sl_percent / 100),
         )
-        filled = order.get("filledQty", qty) if order else qty
-         )
         filled = order.get("filledQty", qty) if order else qty
         self.position_price = price
         self.position_amount = -filled
