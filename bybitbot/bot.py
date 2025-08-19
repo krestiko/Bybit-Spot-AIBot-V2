@@ -164,6 +164,7 @@ class TradingBot:
     def fetch_news_sentiment(self) -> float:
         token = os.getenv("CRYPTO_NEWS_TOKEN")
         if not token:
+            logging.warning("CRYPTO_NEWS_TOKEN not set")
             return 0.0
         now = time.time()
         if now - self._news_time < self.news_cache_interval:
@@ -174,6 +175,7 @@ class TradingBot:
                 params={"auth_token": token, "kind": "news", "public": "true"},
                 timeout=10,
             )
+            resp.raise_for_status()
             data = resp.json()
             posts = data.get("results", [])[:10]
             score = 0.0
@@ -185,7 +187,7 @@ class TradingBot:
             self._news_cache = score / max(len(posts), 1)
             self._news_time = now
             return self._news_cache
-        except Exception as exc:  # pragma: no cover - network issues
+        except requests.RequestException as exc:  # pragma: no cover - network issues
             logging.warning("News fetch error: %s", exc)
             return 0.0
 
@@ -211,8 +213,6 @@ class TradingBot:
             required.append("sma")
         if "ema" in self.indicators:
             df["ema"] = ta.ema(df["close"], length=10)
-            required.append("ema")
-        if "adx" in self.indicators:
             adx = ta.adx(df["high"], df["low"], df["close"], length=14)
             df["adx"] = adx["ADX_14"]
             required.append("adx")
@@ -409,6 +409,8 @@ class TradingBot:
             sl=price * (1 + self.sl_percent / 100),
         )
         filled = order.get("filledQty", qty) if order else qty
+         )
+        filled = order.get("filledQty", qty) if order else qty
         self.position_price = price
         self.position_amount = -filled
         self.trailing_price = (
@@ -432,17 +434,46 @@ class TradingBot:
         self.trailing_price = None
 
     def handle_trailing(self, price: float) -> bool:
-        if self.trailing_price is None:
+        """Update trailing stop and close position if hit.
+
+        Returns ``True`` if the trailing stop triggered and the position was
+        closed, otherwise ``False``.
+        """
+        if self.trailing_price is None or self.position_amount == 0:
             return False
-        if self.position_amount > 0:
+
+        if self.position_amount > 0:  # long position
+            # move trailing price upwards as the market moves in our favour
             if (
                 price > self.position_price
                 and price * (1 - self.trailing_percent / 100) > self.trailing_price
             ):
                 self.trailing_price = price * (1 - self.trailing_percent / 100)
             if price <= self.trailing_price:
-                  sl: Optional[float] = None,
+                self.close_position(price)
+                return True
+        else:  # short position
+            if (
+                price < self.position_price
+                and price * (1 + self.trailing_percent / 100) < self.trailing_price
+            ):
+                self.trailing_price = price * (1 + self.trailing_percent / 100)
+            if price >= self.trailing_price:
+                self.close_position(price)
+                return True
+
+        return False
+
+    def log_trade(
+        self,
+        side: str,
+        price: float,
+        qty: float,
+        pnl: float = 0.0,
+        tp: Optional[float] = None,
+        sl: Optional[float] = None,
     ) -> None:
+        """Append trade information to the trade history file."""
         header = not os.path.exists(self.trade_file)
         with open(self.trade_file, "a") as f:
             if header:
@@ -461,7 +492,7 @@ class TradingBot:
         self.daily_pnl += profit
 
     # ------------------------------------------------------------------
-    def trade_cycle(self) -> None:
+    def trade_cycle(self, max_iterations: Optional[int] = None) -> None:
         use_websocket = os.getenv("USE_WEBSOCKET", "0") == "1"
         if use_websocket:
             from pybit.unified_trading import WebSocket
@@ -510,52 +541,63 @@ class TradingBot:
             ws.kline_stream(self.symbol, "1", _kline_cb)
             ws.orderbook_stream(self.symbol, 1, _order_cb)
 
-        while True:
-            self.reset_daily_pnl()
-            if self.daily_loss_limit and self.daily_pnl <= -self.daily_loss_limit:
-                logging.warning("Daily loss limit reached")
-                break
-            if self.daily_profit_limit and self.daily_pnl >= self.daily_profit_limit:
-                logging.info("Daily profit target reached")
-                break
-            if (
-                use_websocket
-                and None not in (self.last_price, self.last_high, self.last_low, self.last_volume)
-            ):
-                price = self.last_price
-                high = self.last_high
-                low = self.last_low
-                vol = self.last_volume
-                bid = self.last_bid_qty
-                ask = self.last_ask_qty
-            else:
-                price, high, low, vol, bid, ask = self.get_market_data()
-            features = self.update_model(price, high, low, vol, bid, ask)
-            if features is None:
-                time.sleep(self.interval)
-                continue
-            prob = self.model.predict_proba(features)[0][1]
+        iteration = 0
+        try:
+            while True:
+                self.reset_daily_pnl()
+                if self.daily_loss_limit and self.daily_pnl <= -self.daily_loss_limit:
+                    logging.warning("Daily loss limit reached")
+                    break
+                if self.daily_profit_limit and self.daily_pnl >= self.daily_profit_limit:
+                    logging.info("Daily profit target reached")
+                    break
+                if (
+                    use_websocket
+                    and None not in (self.last_price, self.last_high, self.last_low, self.last_volume)
+                ):
+                    price = self.last_price
+                    high = self.last_high
+                    low = self.last_low
+                    vol = self.last_volume
+                    bid = self.last_bid_qty
+                    ask = self.last_ask_qty
+                else:
+                    price, high, low, vol, bid, ask = self.get_market_data()
+                features = self.update_model(price, high, low, vol, bid, ask)
+                if features is None:
+                    time.sleep(self.interval)
+                    continue
+                prob = self.model.predict_proba(features)[0][1]
 
-            if self.position_amount > 0:  # long
-                if (
-                    price >= self.position_price * (1 + self.tp_percent / 100)
-                    or price <= self.position_price * (1 - self.sl_percent / 100)
-                    or self.handle_trailing(price)
-                ):
-                    self.close_position(price)
-            elif self.position_amount < 0:  # short
-                if (
-                    price <= self.position_price * (1 - self.tp_percent / 100)
-                    or price >= self.position_price * (1 + self.sl_percent / 100)
-                    or self.handle_trailing(price)
-                ):
-                    self.close_position(price)
-            if self.position_amount == 0:
-                if prob > self.long_threshold:
-                    self.open_long(price)
-                elif prob < self.short_threshold:
-                    self.open_short(price)
-            time.sleep(self.interval)
+                if self.position_amount > 0:  # long
+                    if (
+                        price >= self.position_price * (1 + self.tp_percent / 100)
+                        or price <= self.position_price * (1 - self.sl_percent / 100)
+                    ):
+                        self.close_position(price)
+                    else:
+                        self.handle_trailing(price)
+                elif self.position_amount < 0:  # short
+                    if (
+                        price <= self.position_price * (1 - self.tp_percent / 100)
+                        or price >= self.position_price * (1 + self.sl_percent / 100)
+                    ):
+                        self.close_position(price)
+                    else:
+                        self.handle_trailing(price)
+                if self.position_amount == 0:
+                    if prob > self.long_threshold:
+                        self.open_long(price)
+                    elif prob < self.short_threshold:
+                        self.open_short(price)
+                time.sleep(self.interval)
+                iteration += 1
+                if max_iterations is not None and iteration >= max_iterations:
+                    break
+        except KeyboardInterrupt:
+            logging.info("Trading loop interrupted by user")
+        except Exception as exc:
+            logging.exception("Error in trading loop: %s", exc)
 
 
 if __name__ == "__main__":
