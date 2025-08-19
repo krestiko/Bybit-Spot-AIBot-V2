@@ -5,8 +5,6 @@ from typing import List, Optional
 
 import joblib
 import numpy as np
-if not hasattr(np, "NaN"):  # compatibility for pandas_ta on NumPy>=2
-    np.NaN = np.nan
 import pandas as pd
 import pandas_ta as ta
 import requests
