@@ -138,18 +138,24 @@ class TradingBot:
 
     def _init_model(self) -> None:
         if os.path.exists(self.model_file):
-            saved = joblib.load(self.model_file)
-            self.model = saved.get("model")
-            self.scaler = saved.get("scaler", self.scaler)
-            self.model_initialized = True
+            try:
+                saved = joblib.load(self.model_file)
+                self.model = saved.get("model")
+                self.scaler = saved.get("scaler", self.scaler)
+                self.model_initialized = True
+                return
+            except Exception as exc:
+                logging.warning("Failed to load model file: %s", exc)
+
+        if self.model_type == "xgb":
+            self.model = XGBClassifier(use_label_encoder=False, eval_metric="logloss")
+        elif self.model_type == "gb":
+            self.model = GradientBoostingClassifier()
+        elif self.model_type == "sgd":
+            self.model = SGDClassifier(loss="log_loss")
         else:
-            if self.model_type == "xgb":
-                self.model = XGBClassifier(use_label_encoder=False, eval_metric="logloss")
-            elif self.model_type == "gb":
-                self.model = GradientBoostingClassifier()
-            else:
-                self.model = SGDClassifier(loss="log_loss")
-            self.model_initialized = False
+            raise ValueError(f"Unsupported model_type: {self.model_type}")
+        self.model_initialized = False
 
     # ------------------------------------------------------------------
     def send_telegram(self, msg: str, timeout: int = 5) -> None:
@@ -234,7 +240,9 @@ class TradingBot:
             required.append("obv")
         denom = df["bid_qty"] + df["ask_qty"]
         df["bid_ask_ratio"] = np.where(denom == 0, 0, (df["bid_qty"] - df["ask_qty"]) / denom)
-        required.append("bid_ask_ratio")
+        tech_count = len([i for i in self.indicators if i != "news"])
+        if not ("news" in self.indicators and tech_count > 1):
+            required.append("bid_ask_ratio")
         if "news" in self.indicators:
             df["sentiment"] = self.fetch_news_sentiment()
             required.append("sentiment")
@@ -308,7 +316,10 @@ class TradingBot:
                 pass
         self.train_counter += 1
         if self.train_counter % self.model_save_interval == 0:
-            joblib.dump({"model": self.model, "scaler": self.scaler}, self.model_file)
+            try:
+                joblib.dump({"model": self.model, "scaler": self.scaler}, self.model_file)
+            except Exception as exc:
+                logging.warning("Failed to save model: %s", exc)
         self.model_initialized = True
         latest = self.compute_features(df.iloc[-self.history_len :])
         return self.scaler.transform(latest) if latest is not None else None
