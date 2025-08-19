@@ -2,7 +2,7 @@ import os
 import time
 import logging
 import asyncio
-from typing import List, Optional
+from typing import List, Optional, Any
 
 import joblib
 import numpy as np
@@ -22,6 +22,8 @@ from sklearn.linear_model import SGDClassifier
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 
+logger = logging.getLogger(__name__)
+
 load_dotenv()
 
 
@@ -32,34 +34,35 @@ class TradingBot:
         self.config = self._load_config(config_file)
         log_level_str = os.getenv("LOG_LEVEL") or self.config.get("logging", {}).get("level", "INFO")
         log_level = getattr(logging, log_level_str.upper(), logging.INFO)
-        logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s %(message)s")
+        if not logging.getLogger().handlers:
+            logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s %(message)s")
+        else:
+            logging.getLogger().setLevel(log_level)
         self.api_key = os.getenv("BYBIT_API_KEY")
         self.api_secret = os.getenv("BYBIT_API_SECRET")
         self.symbol = os.getenv("SYMBOL", "BTCUSDT")
-        self.trade_amount = float(os.getenv("TRADE_AMOUNT_USDT", 10))
-        self.min_trade_amount = float(
-            self.config.get("trade", {}).get(
-                "min_trade_amount", os.getenv("MIN_TRADE_AMOUNT_USDT", 1)
-            )
+        self.trade_amount = self._get_env_float("TRADE_AMOUNT_USDT", 10)
+        self.min_trade_amount = self.config.get("trade", {}).get(
+            "min_trade_amount", self._get_env_float("MIN_TRADE_AMOUNT_USDT", 1)
         )
-        self.tp_percent = float(
-            self.config.get("trade", {}).get("tp_percent", os.getenv("TP_PERCENT", 1.5))
+        self.tp_percent = self.config.get("trade", {}).get(
+            "tp_percent", self._get_env_float("TP_PERCENT", 1.5)
         )
-        self.sl_percent = float(
-            self.config.get("trade", {}).get("sl_percent", os.getenv("SL_PERCENT", 1.0))
+        self.sl_percent = self.config.get("trade", {}).get(
+            "sl_percent", self._get_env_float("SL_PERCENT", 1.0)
         )
-        self.interval = int(os.getenv("INTERVAL", 5)) * 60
-        self.max_retries = int(os.getenv("MAX_RETRIES", 3))
-        self.retrain_interval = int(os.getenv("RETRAIN_INTERVAL", 50))
-        self.history_len = int(os.getenv("HISTORY_LENGTH", 100))
+        self.interval = self._get_env_int("INTERVAL", 5) * 60
+        self.max_retries = self._get_env_int("MAX_RETRIES", 3)
+        self.retrain_interval = self._get_env_int("RETRAIN_INTERVAL", 50)
+        self.history_len = self._get_env_int("HISTORY_LENGTH", 100)
         self.price_file = os.getenv("PRICE_HISTORY_FILE", "price_history.csv")
         self.trade_file = os.getenv("TRADE_HISTORY_FILE", "trade_history.csv")
-        self.save_interval = int(os.getenv("SAVE_INTERVAL", 10))
-        self.trailing_percent = float(os.getenv("TRAILING_PERCENT", 0))
+        self.save_interval = self._get_env_int("SAVE_INTERVAL", 10)
+        self.trailing_percent = self._get_env_float("TRAILING_PERCENT", 0)
         self.model_type = self.config.get("trade", {}).get("model_type", os.getenv("MODEL_TYPE", "gb"))
-        self.model_save_interval = int(os.getenv("MODEL_SAVE_INTERVAL", 10))
-        self.daily_loss_limit = float(os.getenv("DAILY_STOP_LOSS", 0))
-        self.daily_profit_limit = float(os.getenv("DAILY_TAKE_PROFIT", 0))
+        self.model_save_interval = self._get_env_int("MODEL_SAVE_INTERVAL", 10)
+        self.daily_loss_limit = self._get_env_float("DAILY_STOP_LOSS", 0)
+        self.daily_profit_limit = self._get_env_float("DAILY_TAKE_PROFIT", 0)
         self._indicators: List[str] = self.config.get(
             "indicators",
             ["rsi", "macd", "bb", "sma", "ema", "adx", "stoch", "obv"],
@@ -72,6 +75,7 @@ class TradingBot:
             columns=["close", "high", "low", "volume", "bid_qty", "ask_qty"]
         )
         self._write_counter = 0
+        self._pending_price_save = False
         self._trade_buffer: List[str] = []
         self.features_list: List[np.ndarray] = []
         self.labels_list: List[int] = []
@@ -98,10 +102,10 @@ class TradingBot:
 
         self._news_cache: float = 0.0
         self._news_time: float = 0.0
-        self.news_cache_interval = int(os.getenv("NEWS_CACHE_MINUTES", 30)) * 60
+        self.news_cache_interval = self._get_env_int("NEWS_CACHE_MINUTES", 30) * 60
 
-        self.long_threshold = float(os.getenv("LONG_THRESHOLD", 0.55))
-        self.short_threshold = float(os.getenv("SHORT_THRESHOLD", 0.45))
+        self.long_threshold = self._get_env_float("LONG_THRESHOLD", 0.55)
+        self.short_threshold = self._get_env_float("SHORT_THRESHOLD", 0.45)
 
     @property
     def indicators(self) -> List[str]:
@@ -120,6 +124,28 @@ class TradingBot:
             with open(path, "r") as f:
                 return yaml.safe_load(f) or {}
         return {}
+
+    @staticmethod
+    def _get_env_float(name: str, default: float) -> float:
+        val = os.getenv(name)
+        if val is None:
+            return default
+        try:
+            return float(val)
+        except ValueError:
+            logger.warning("Invalid value for %s: %s", name, val)
+            return default
+
+    @staticmethod
+    def _get_env_int(name: str, default: int) -> int:
+        val = os.getenv(name)
+        if val is None:
+            return default
+        try:
+            return int(val)
+        except ValueError:
+            logger.warning("Invalid value for %s: %s", name, val)
+            return default
 
     def _split_symbol(self, symbol: str) -> tuple[str, str]:
         quotes = ["USDT", "USDC", "BTC", "ETH", "EUR", "USD"]
@@ -163,7 +189,7 @@ class TradingBot:
                 self.model_initialized = True
                 return
             except Exception as exc:
-                logging.warning("Failed to load model file: %s", exc)
+                logger.warning("Failed to load model file: %s", exc)
 
         if self.model_type == "xgb":
             self.model = XGBClassifier(use_label_encoder=False, eval_metric="logloss")
@@ -187,14 +213,14 @@ class TradingBot:
                 timeout=timeout,
             )
         except requests.Timeout:
-            logging.warning("Telegram send timeout")
+            logger.warning("Telegram send timeout")
         except requests.RequestException as exc:  # pragma: no cover - network issues
-            logging.warning("Telegram error: %s", exc)
+            logger.warning("Telegram error: %s", exc)
 
     def fetch_news_sentiment(self) -> float:
         token = os.getenv("CRYPTO_NEWS_TOKEN")
         if not token:
-            logging.warning("CRYPTO_NEWS_TOKEN not set")
+            logger.warning("CRYPTO_NEWS_TOKEN not set")
             return 0.0
         now = time.time()
         if now - self._news_time < self.news_cache_interval:
@@ -218,7 +244,7 @@ class TradingBot:
             self._news_time = now
             return self._news_cache
         except requests.RequestException as exc:  # pragma: no cover - network issues
-            logging.warning("News fetch error: %s", exc)
+            logger.warning("News fetch error: %s", exc)
             return 0.0
 
     # ------------------------------------------------------------------
@@ -258,9 +284,7 @@ class TradingBot:
             required.append("obv")
         denom = df["bid_qty"] + df["ask_qty"]
         df["bid_ask_ratio"] = np.where(denom == 0, 0, (df["bid_qty"] - df["ask_qty"]) / denom)
-        tech_count = len([i for i in self.indicators if i != "news"])
-        if not ("news" in self.indicators and tech_count > 1):
-            required.append("bid_ask_ratio")
+        required.append("bid_ask_ratio")
         if "news" in self.indicators:
             df["sentiment"] = self.fetch_news_sentiment()
             required.append("sentiment")
@@ -278,11 +302,11 @@ class TradingBot:
         expected = 1
         for ind in self.indicators:
             if ind not in feature_counts:
-                logging.warning("Unknown indicator: %s", ind)
+                logger.warning("Unknown indicator: %s", ind)
                 return None
             expected += feature_counts[ind]
         if len(required) != expected:
-            logging.warning(
+            logger.warning(
                 "Indicator feature mismatch: expected %d, got %d", expected, len(required)
             )
             return None
@@ -301,8 +325,13 @@ class TradingBot:
         if len(self.history_df) > self.history_len + 50:
             self.history_df = self.history_df.iloc[-(self.history_len + 50) :]
         self._write_counter += 1
-        if self._write_counter % self.save_interval == 0:
-            self.history_df.to_csv(self.price_file, index=False)
+        if self._write_counter % self.save_interval == 0 or self._pending_price_save:
+            try:
+                self.history_df.to_csv(self.price_file, index=False)
+                self._pending_price_save = False
+            except OSError as exc:
+                logger.warning("Unable to save price history: %s", exc)
+                self._pending_price_save = True
 
     def compute_trade_amount(self) -> float:
         """Return position size based on recent volatility."""
@@ -346,12 +375,12 @@ class TradingBot:
             elif self.train_counter % self.retrain_interval == 0:
                 self.model.fit(Xs, y)
         except Exception as exc:
-            logging.warning("Model train error: %s", exc)
+            logger.warning("Model train error: %s", exc)
         if len(Xs) and hasattr(self.model, "predict"):
             try:
                 preds = self.model.predict(Xs)
                 acc = float((preds == y).mean())
-                logging.info("Training accuracy: %.3f", acc)
+                logger.info("Training accuracy: %.3f", acc)
             except Exception:
                 pass
         self.train_counter += 1
@@ -359,7 +388,7 @@ class TradingBot:
             try:
                 joblib.dump({"model": self.model, "scaler": self.scaler}, self.model_file)
             except Exception as exc:
-                logging.warning("Failed to save model: %s", exc)
+                logger.warning("Failed to save model: %s", exc)
         self.model_initialized = True
         latest = self.compute_features(df.iloc[-self.history_len :])
         return self.scaler.transform(latest) if latest is not None else None
@@ -388,17 +417,17 @@ class TradingBot:
                 ask_qty = float(ob["result"]["a"][0][1])
                 return price, high, low, volume, bid_qty, ask_qty
             except Exception as exc:
-                logging.warning("Market data error: %s", exc)
+                logger.warning("Market data error: %s", exc)
                 time.sleep(1)
         raise RuntimeError("Failed to fetch market data")
 
     def place_order(
         self, side: str, qty: float, tp: Optional[float] = None, sl: Optional[float] = None
-    ):
+    ) -> Optional[dict[str, Any]]:
         simulate = not (self.api_key and self.api_secret)
         if simulate:
-            logging.info("Simulated order: %s %s", side, qty)
-            return {"price": self.last_price, "qty": qty, "filledQty": qty}
+            logger.info("Simulated order: %s %s", side, qty)
+            return {"response": None, "filledQty": qty}
 
         price = self.last_price or 0
         try:
@@ -407,10 +436,10 @@ class TradingBot:
             avail = float(bal["result"]["list"][0]["availableBalance"])
             needed = qty * price if side.lower() == "buy" else qty
             if avail < needed:
-                logging.warning("Insufficient balance: have %s need %s", avail, needed)
+                logger.warning("Insufficient balance: have %s need %s", avail, needed)
                 return None
         except Exception as exc:
-            logging.warning("Balance check error: %s", exc)
+            logger.warning("Balance check error: %s", exc)
 
         for _ in range(self.max_retries):
             try:
@@ -432,12 +461,12 @@ class TradingBot:
                         )
                         ord_info = status.get("result", {}).get("list", [{}])[0]
                         filled = float(ord_info.get("cumExecQty", filled))
-                        logging.info("Order status: %s", ord_info.get("orderStatus"))
+                        logger.info("Order status: %s", ord_info.get("orderStatus"))
                     except Exception as exc:
-                        logging.warning("Order status error: %s", exc)
+                        logger.warning("Order status error: %s", exc)
                 return {"response": order, "filledQty": filled}
             except Exception as exc:
-                logging.warning("Order error: %s", exc)
+                logger.warning("Order error: %s", exc)
                 time.sleep(1)
         raise RuntimeError("Failed to place order")
 
@@ -445,45 +474,39 @@ class TradingBot:
     def open_long(self, price: float) -> None:
         qty = self._round_qty(self.compute_trade_amount() / price)
         if qty < self.qty_step:
-            logging.warning(
+            logger.warning(
                 "Computed quantity %s below qty_step %s", qty, self.qty_step
             )
             return
-        order = self.place_order(
-            "buy",
-            qty,
-            tp=price * (1 + self.tp_percent / 100),
-            sl=price * (1 - self.sl_percent / 100),
-        )
+        tp_price = price * (1 + self.tp_percent / 100)
+        sl_price = price * (1 - self.sl_percent / 100)
+        order = self.place_order("buy", qty, tp=tp_price, sl=sl_price)
         filled = order.get("filledQty", qty) if order else qty
         self.position_price = price
         self.position_amount = filled
         self.trailing_price = (
             price * (1 - self.trailing_percent / 100) if self.trailing_percent else None
         )
-        self.log_trade("buy", price, filled, tp=self.tp_percent, sl=self.sl_percent)
+        self.log_trade("buy", price, filled, tp=tp_price, sl=sl_price)
         self.send_telegram(f"Opened long {filled:.6f} {self.symbol} @ {price}")
 
     def open_short(self, price: float) -> None:
         qty = self._round_qty(self.compute_trade_amount() / price)
         if qty < self.qty_step:
-            logging.warning(
+            logger.warning(
                 "Computed quantity %s below qty_step %s", qty, self.qty_step
             )
             return
-        order = self.place_order(
-            "sell",
-            qty,
-            tp=price * (1 - self.tp_percent / 100),
-            sl=price * (1 + self.sl_percent / 100),
-        )
+        tp_price = price * (1 - self.tp_percent / 100)
+        sl_price = price * (1 + self.sl_percent / 100)
+        order = self.place_order("sell", qty, tp=tp_price, sl=sl_price)
         filled = order.get("filledQty", qty) if order else qty
         self.position_price = price
         self.position_amount = -filled
         self.trailing_price = (
             price * (1 + self.trailing_percent / 100) if self.trailing_percent else None
         )
-        self.log_trade("sell", price, filled, tp=self.tp_percent, sl=self.sl_percent)
+        self.log_trade("sell", price, filled, tp=tp_price, sl=sl_price)
         self.send_telegram(f"Opened short {filled:.6f} {self.symbol} @ {price}")
 
     def close_position(self, price: float) -> None:
@@ -560,7 +583,7 @@ class TradingBot:
                     f.write(rec)
             self._trade_buffer.clear()
         except OSError as exc:
-            logging.warning("Unable to write trade log: %s", exc)
+            logger.warning("Unable to write trade log: %s", exc)
             self._trade_buffer = records
 
     def reset_daily_pnl(self) -> None:
@@ -575,6 +598,7 @@ class TradingBot:
     # ------------------------------------------------------------------
     async def trade_cycle(self, max_iterations: Optional[int] = None) -> None:
         use_websocket = os.getenv("USE_WEBSOCKET", "0") == "1"
+        ws = None
         if use_websocket:
             from pybit.unified_trading import WebSocket
 
@@ -627,10 +651,10 @@ class TradingBot:
             while True:
                 self.reset_daily_pnl()
                 if self.daily_loss_limit and self.daily_pnl <= -self.daily_loss_limit:
-                    logging.warning("Daily loss limit reached")
+                    logger.warning("Daily loss limit reached")
                     break
                 if self.daily_profit_limit and self.daily_pnl >= self.daily_profit_limit:
-                    logging.info("Daily profit target reached")
+                    logger.info("Daily profit target reached")
                     break
                 if (
                     use_websocket
@@ -680,12 +704,20 @@ class TradingBot:
                 if max_iterations is not None and iteration >= max_iterations:
                     break
         except asyncio.CancelledError:
-            logging.info("Trading loop cancelled")
+            logger.info("Trading loop cancelled")
             raise
         except KeyboardInterrupt:
-            logging.info("Trading loop interrupted by user")
+            logger.info("Trading loop interrupted by user")
         except Exception as exc:
-            logging.exception("Error in trading loop: %s", exc)
+            logger.exception("Error in trading loop: %s", exc)
+        finally:
+            if use_websocket and ws is not None:
+                try:
+                    close = getattr(ws, "close", None) or getattr(ws, "exit", None)
+                    if close:
+                        close()
+                except Exception as exc:
+                    logger.warning("Failed to close WebSocket: %s", exc)
 
 
 if __name__ == "__main__":
