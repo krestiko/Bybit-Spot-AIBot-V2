@@ -11,7 +11,7 @@ import numpy as np
 
 try:  # pragma: no cover - needed for pandas_ta on NumPy>=2
     from numpy import NaN  # type: ignore  # noqa: F401
-except Exception:  # pragma: no cover
+except (ImportError, AttributeError):  # pragma: no cover
     np.NaN = np.nan
 import pandas as pd
 import pandas_ta as ta
@@ -136,9 +136,7 @@ class TradingBot:
         self.strategy = strategy or MLProbabilityStrategy(
             self.long_threshold, self.short_threshold
         )
-        if hasattr(self.strategy, "set_model"):
-            # type: ignore[call-arg]
-            self.strategy.set_model(self.model)
+        self.strategy.set_model(self.model)
 
     @property
     def indicators(self) -> List[str]:
@@ -189,7 +187,7 @@ class TradingBot:
             info = self.session.get_instruments_info(category="spot", symbol=symbol)
             item = info.get("result", {}).get("list", [{}])[0]
             return item.get("baseCoin", symbol[:-4]), item.get("quoteCoin", symbol[-4:])
-        except Exception:
+        except (requests.RequestException, KeyError, IndexError):
             return symbol[:-4], symbol[-4:]
 
     def _get_qty_step(self) -> float:
@@ -208,7 +206,7 @@ class TradingBot:
             lot = item.get("lotSizeFilter", {})
             step = float(lot.get("qtyStep", 1))
             return step if step > 0 else 1.0
-        except Exception:
+        except (requests.RequestException, KeyError, TypeError, ValueError):
             return 1.0
 
     def _round_qty(self, qty: float) -> float:
@@ -223,7 +221,7 @@ class TradingBot:
                 self.scaler = saved.get("scaler", self.scaler)
                 self.model_initialized = True
                 return
-            except Exception as exc:
+            except (OSError, ValueError) as exc:
                 logger.warning("Failed to load model file: %s", exc)
 
         if self.model_type == "xgb":
@@ -426,14 +424,14 @@ class TradingBot:
                 )
             elif self.train_counter % self.retrain_interval == 0:
                 self.model.fit(Xs, y)
-        except Exception as exc:
+        except (ValueError, RuntimeError) as exc:
             logger.warning("Model train error: %s", exc)
         if len(Xs) and hasattr(self.model, "predict"):
             try:
                 preds = self.model.predict(Xs)
                 acc = float((preds == y).mean())
                 logger.info("Training accuracy: %.3f", acc)
-            except Exception:
+            except (ValueError, RuntimeError, AttributeError):
                 pass
         self.train_counter += 1
         if self.train_counter % self.model_save_interval == 0:
@@ -441,7 +439,7 @@ class TradingBot:
                 joblib.dump(
                     {"model": self.model, "scaler": self.scaler}, self.model_file
                 )
-            except Exception as exc:
+            except OSError as exc:
                 logger.warning("Failed to save model: %s", exc)
         self.model_initialized = True
         latest = self.compute_features(df.iloc[-self.history_len :])
@@ -463,7 +461,7 @@ class TradingBot:
                     high = float(kitem[2])
                     low = float(kitem[3])
                     volume = float(kitem[5])
-                except Exception:
+                except (requests.RequestException, KeyError, IndexError, ValueError):
                     high = low = price
                     volume = float(
                         ticker.get("volume24h", ticker.get("turnover24h", 0))
@@ -474,7 +472,7 @@ class TradingBot:
                 bid_qty = float(ob["result"]["b"][0][1])
                 ask_qty = float(ob["result"]["a"][0][1])
                 return price, high, low, volume, bid_qty, ask_qty
-            except Exception as exc:
+            except (requests.RequestException, KeyError, IndexError, ValueError) as exc:
                 logger.warning("Market data error: %s", exc)
                 time.sleep(1)
         raise RuntimeError("Failed to fetch market data")
@@ -505,7 +503,7 @@ class TradingBot:
             if avail < needed:
                 logger.warning("Insufficient balance: have %s need %s", avail, needed)
                 return None
-        except Exception as exc:
+        except (requests.RequestException, KeyError, ValueError) as exc:
             logger.warning("Balance check error: %s", exc)
 
         for _ in range(self.max_retries):
@@ -536,10 +534,10 @@ class TradingBot:
                         ord_info = status.get("result", {}).get("list", [{}])[0]
                         filled = float(ord_info.get("cumExecQty", filled))
                         logger.info("Order status: %s", ord_info.get("orderStatus"))
-                    except Exception as exc:
+                    except (requests.RequestException, KeyError, ValueError) as exc:
                         logger.warning("Order status error: %s", exc)
                 return {"response": order, "filledQty": filled}
-            except Exception as exc:
+            except (requests.RequestException, ValueError) as exc:
                 logger.warning("Order error: %s", exc)
                 await asyncio.sleep(1)
         raise RuntimeError("Failed to place order")
@@ -556,7 +554,12 @@ class TradingBot:
         tp_price = price * (1 + self.tp_percent / 100)
         sl_price = price * (1 - self.sl_percent / 100)
         order = await self.place_order("buy", qty, tp=tp_price, sl=sl_price)
-        filled = order.get("filledQty", qty) if order else qty
+        if not order:
+            return
+        filled = float(order.get("filledQty", 0))
+        if filled <= 0:
+            logger.warning("No quantity filled for long order")
+            return
         self.position_price = price
         self.position_amount = filled
         self.trailing_price = (
@@ -576,7 +579,12 @@ class TradingBot:
         tp_price = price * (1 - self.tp_percent / 100)
         sl_price = price * (1 + self.sl_percent / 100)
         order = await self.place_order("sell", qty, tp=tp_price, sl=sl_price)
-        filled = order.get("filledQty", qty) if order else qty
+        if not order:
+            return
+        filled = float(order.get("filledQty", 0))
+        if filled <= 0:
+            logger.warning("No quantity filled for short order")
+            return
         self.position_price = price
         self.position_amount = -filled
         self.trailing_price = (
@@ -592,7 +600,7 @@ class TradingBot:
         qty = abs(self.position_amount)
         try:
             order = await self.place_order(side, qty)
-        except Exception as exc:
+        except (RuntimeError, requests.RequestException) as exc:
             logger.warning("Close position error: %s", exc)
             return
         if not order:
@@ -687,7 +695,7 @@ class TradingBot:
             self._trade_buffer = records
 
     def reset_daily_pnl(self) -> None:
-        self.risk_manager._reset_if_new_day()
+        self.risk_manager.reset_if_new_day()
         self.daily_pnl = self.risk_manager.daily_pnl
         self.daily_date = self.risk_manager.daily_date
 
@@ -754,7 +762,7 @@ class TradingBot:
                         self.last_bid_qty = float(bids[0][1])
                     if asks:
                         self.last_ask_qty = float(asks[0][1])
-                except Exception:
+                except (ValueError, IndexError, TypeError):
                     pass
 
             ws = WebSocket("spot")
@@ -785,6 +793,12 @@ class TradingBot:
                     price, high, low, vol, bid, ask = await asyncio.to_thread(
                         self.get_market_data
                     )
+                    self.last_price = price
+                    self.last_high = high
+                    self.last_low = low
+                    self.last_volume = vol
+                    self.last_bid_qty = bid
+                    self.last_ask_qty = ask
                 features = await asyncio.to_thread(
                     self.update_model, price, high, low, vol, bid, ask
                 )
@@ -792,10 +806,7 @@ class TradingBot:
                     await asyncio.sleep(self.interval)
                     continue
                 prob = self.model.predict_proba(features)[0][1]
-                if hasattr(self.strategy, "decide_with_prob"):
-                    action = self.strategy.decide_with_prob(features, price, prob)
-                else:
-                    action = self.strategy.decide(features, price)
+                action = self.strategy.decide_with_prob(features, price, prob)
 
                 if self.position_amount > 0:  # long
                     if price >= self.position_price * (
@@ -829,7 +840,7 @@ class TradingBot:
             raise
         except KeyboardInterrupt:
             logger.info("Trading loop interrupted by user")
-        except Exception as exc:
+        except (requests.RequestException, ValueError, RuntimeError) as exc:
             logger.exception("Error in trading loop: %s", exc)
         finally:
             if use_websocket and ws is not None:
@@ -837,5 +848,5 @@ class TradingBot:
                     close = getattr(ws, "close", None) or getattr(ws, "exit", None)
                     if close:
                         close()
-                except Exception as exc:
+                except (RuntimeError, AttributeError) as exc:
                     logger.warning("Failed to close WebSocket: %s", exc)

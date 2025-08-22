@@ -22,6 +22,10 @@ class RiskManager:
             self.daily_date = today
             self.daily_pnl = 0.0
 
+    def reset_if_new_day(self) -> None:
+        """Public wrapper to reset PnL counters when day changes."""
+        self._reset_if_new_day()
+
     def can_trade(self) -> bool:
         """Check whether trading is allowed based on daily limits."""
         self._reset_if_new_day()
