@@ -92,8 +92,6 @@ class TradingBot:
         self.model_file = os.getenv("MODEL_FILE", "model.pkl")
 
         self.risk_manager = risk_manager or RiskManager(
-            self.tp_percent,
-            self.sl_percent,
             d_loss,
             d_profit,
         )
@@ -148,7 +146,7 @@ class TradingBot:
 
     @indicators.setter
     def indicators(self, value: List[str]) -> None:
-        self._indicators = value
+        self._indicators = list(dict.fromkeys(value))
         self.features_list.clear()
         self.labels_list.clear()
         self.scaler = StandardScaler()
@@ -493,7 +491,10 @@ class TradingBot:
             logger.info("Simulated order: %s %s", side, qty)
             return {"response": None, "filledQty": qty}
 
-        price = self.last_price or 0
+        price = self.last_price
+        if price is None:
+            logger.error("Cannot place order without last price")
+            return None
         try:
             coin = self.quote_asset if side.lower() == "buy" else self.base_asset
             bal = await asyncio.to_thread(
@@ -509,16 +510,19 @@ class TradingBot:
 
         for _ in range(self.max_retries):
             try:
-                order = await asyncio.to_thread(
-                    self.session.place_order,
-                    category="spot",
-                    symbol=self.symbol,
-                    side="Buy" if side.lower() == "buy" else "Sell",
-                    orderType="Market",
-                    qty=qty,
-                    takeProfit=tp,
-                    stopLoss=sl,
-                )
+                params = {
+                    "category": "spot",
+                    "symbol": self.symbol,
+                    "side": "Buy" if side.lower() == "buy" else "Sell",
+                    "orderType": "Market",
+                    "qty": qty,
+                }
+                if tp is not None:
+                    params["takeProfit"] = tp
+                if sl is not None:
+                    params["stopLoss"] = sl
+
+                order = await asyncio.to_thread(self.session.place_order, **params)
                 order_id = order.get("result", {}).get("orderId")
                 filled = qty
                 if order_id:
@@ -835,8 +839,3 @@ class TradingBot:
                         close()
                 except Exception as exc:
                     logger.warning("Failed to close WebSocket: %s", exc)
-
-
-if __name__ == "__main__":
-    bot = TradingBot()
-    asyncio.run(bot.trade_cycle())

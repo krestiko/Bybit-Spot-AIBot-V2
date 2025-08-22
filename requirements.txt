@@ -1,9 +1,10 @@
 pandas
+pandas-ta
+pybit
+pydantic
+pydantic-settings
+numpy
 scikit-learn
 xgboost
-pandas_ta
-pybit
-python-dotenv
-pyyaml
 joblib
 requests

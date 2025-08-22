@@ -4,17 +4,13 @@ import time
 
 
 class RiskManager:
-    """Basic risk management handling TP/SL and daily limits."""
+    """Basic risk management handling daily loss/profit limits."""
 
     def __init__(
         self,
-        tp_percent: float,
-        sl_percent: float,
         daily_loss_limit: float = 0.0,
         daily_profit_limit: float = 0.0,
     ) -> None:
-        self.tp_percent = tp_percent
-        self.sl_percent = sl_percent
         self.daily_loss_limit = daily_loss_limit
         self.daily_profit_limit = daily_profit_limit
         self.daily_pnl = 0.0
